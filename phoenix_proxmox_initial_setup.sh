@@ -2,7 +2,7 @@
 
 # phoenix_proxmox_initial_setup.sh
 # Initial setup for Proxmox VE
-# Version: 1.0.3
+# Version: 1.0.4
 # Author: Heads, Grok, Devstral
 # Usage: ./phoenix_proxmox_initial_setup.sh [--no-reboot]
 # Note: Configure log rotation for $LOGFILE using /etc/logrotate.d/proxmox_setup
@@ -35,50 +35,48 @@ check_root() {
   fi
 }
 
-# Update Proxmox VE system and install required packages using common functions
+# Update system packages and configure NTP
 update_system() {
   retry_command "apt-get update && apt-get upgrade -y"
-  if ! check_package ntp; then
-    retry_command "apt-get install -y ntp"
-  fi
-  echo "[$(date)] System updated and NTP installed" >> "$LOGFILE"
-
-  # Set timezone using common function
-  setup_timezone() {
-    if [[ -z $(timedatectl show --property=Timezone | cut -d '=' -f2) ]]; then
-      read -p "Enter your desired time zone (e.g., Europe/Berlin): " TIMEZONE
-      retry_command "timedatectl set-timezone $TIMEZONE"
-      echo "[$(date)] Timezone set to $TIMEZONE" >> "$LOGFILE"
-    fi
-  }
 
   setup_timezone
-
-  # Configure NTP using common function
-  configure_ntp() {
-    if ! grep -q "^server [0-9]" /etc/ntp.conf; then
-      echo "server 0.pool.ntp.org iburst" >> /etc/ntp.conf || { echo "Error: Failed to configure NTP"; exit 1; }
-      systemctl restart ntp || { echo "Error: Failed to restart NTP service"; exit 1; }
-    fi
-    echo "[$(date)] Configured NTP server in /etc/ntp.conf" >> "$LOGFILE"
-  }
-
   configure_ntp
 
-  # Disable unnecessary services using common function
-  disable_unnecessary_services() {
-    if systemctl is-enabled rsyslog >/dev/null; then
-      retry_command "systemctl stop rsyslog && systemctl disable rsyslog"
-      echo "[$(date)] Disabled and stopped rsyslog service" >> "$LOGFILE"
-    fi
+  echo "[$(date)] System updated and NTP configured" >> "$LOGFILE"
+}
 
-    if systemctl is-active rsyslog >/dev/null; then
-      retry_command "systemctl mask rsyslog"
-      echo "[$(date)] Masked rsyslog service to prevent accidental enabling" >> "$LOGFILE"
-    fi
-  }
+setup_timezone() {
+  read -p "Enter timezone (e.g., Europe/Berlin): " TIMEZONE
+  if timedatectl list-timezones | grep -q "^$TIMEZONE$"; then
+    retry_command "timedatectl set-timezone $TIMEZONE"
+    echo "[$(date)] Timezone set to $TIMEZONE" >> "$LOGFILE"
+  else
+    echo "Error: Invalid timezone specified." | tee -a "$LOGFILE"
+    exit 1
+  fi
+}
 
-  disable_unnecessary_services
+configure_ntp() {
+  retry_command "apt-get install -y chrony"
+  systemctl enable --now chrony.service
+
+  if ! systemctl is-active --quiet chrony.service; then
+    echo "Error: Failed to start chrony service." | tee -a "$LOGFILE"
+    exit 1
+  fi
+
+  echo "[$(date)] NTP configured with Chrony" >> "$LOGFILE"
+}
+
+disable_unnecessary_services() {
+  retry_command "systemctl disable --now apparmor.service"
+  retry_command "systemctl disable --now pve-cluster.service"
+
+  if ! systemctl is-enabled --quiet apparmor.service && ! systemctl is-enabled --quiet pve-cluster.service; then
+    echo "[$(date)] Unnecessary services disabled" >> "$LOGFILE"
+  else
+    echo "Warning: Failed to disable unnecessary services." | tee -a "$LOGFILE"
+  fi
 }
 
 # Configure network settings using common function
@@ -96,6 +94,13 @@ configure_network() {
   configure_static_ip() {
     read -p "Enter the network interface (e.g., ens18): " INTERFACE
     read -p "Enter the IP address for this server (e.g., 192.168.0.2/24): " IP_ADDRESS
+
+    # Validate IP address format
+    if ! [[ "$IP_ADDRESS" =~ ^[0-9]{1,3}\.[0-9]{1,3}\.[0-9]{1,3}\.[0-9]{1,3}/[0-9]{1,2}$ ]]; then
+      echo "Error: Invalid IP address format: $IP_ADDRESS" | tee -a "$LOGFILE"
+      exit 1
+    fi
+
     if ! ip addr show "$INTERFACE" > /dev/null; then
       echo "Error: Interface $INTERFACE does not exist." | tee -a "$LOGFILE"
       exit 1
@@ -107,56 +112,43 @@ iface $INTERFACE inet static
 address $IP_ADDRESS
 EOF
 
-    retry_command "systemctl restart networking"
     echo "[$(date)] Configured static IP for interface $INTERFACE with address $IP_ADDRESS" >> "$LOGFILE"
   }
+}
 
-  configure_static_ip
+update_hosts_file() {
+  if ! grep -q "^127.0.1.1.*$HOSTNAME" /etc/hosts; then
+    echo "127.0.1.1 $HOSTNAME" >> /etc/hosts || { echo "Error: Failed to update /etc/hosts" | tee -a "$LOGFILE"; exit 1; }
+  fi
 
-  # Update /etc/hosts file using common function
-  update_hosts_file() {
-    if ! grep -q "^127.0.1.1.*$HOSTNAME" /etc/hosts; then
-      echo "127.0.1.1 $HOSTNAME" >> /etc/hosts || { echo "Error: Failed to update /etc/hosts"; exit 1; }
-    fi
-    echo "[$(date)] Updated /etc/hosts with $HOSTNAME" >> "$LOGFILE"
-  }
+  echo "[$(date)] Updated /etc/hosts with $HOSTNAME" >> "$LOGFILE"
+}
 
-  update_hosts_file
+# Setup firewall rules
+setup_firewall() {
+  # Allow Proxmox VE services through the firewall
+  retry_command "ufw allow OpenSSH"
 
-  # Set up firewall rules using common function
-  setup_firewall() {
-    if ! ufw status | grep -q "Status: active"; then
-      retry_command "ufw allow ssh && ufw enable"
-      echo "[$(date)] Enabled UFW and allowed SSH traffic" >> "$LOGFILE"
-    fi
+  # Check for Samba installation before applying firewall rule
+  if check_package samba; then
+    retry_command "ufw allow Samba"
+  fi
 
-    # Allow Proxmox VE services using common function
-    for service in 80/tcp 443/tcp 5900:6100/tcp; do
-      set_firewall_rule "allow $service"
-    done
-    echo "[$(date)] Allowed Proxmox VE services through UFW" >> "$LOGFILE"
+  # Check for NFS installation before applying firewall rule
+  if check_package nfs-kernel-server; then
+    retry_command "ufw allow from $PROXMOX_NFS_SERVER to any port nfs"
+  fi
 
-    # Allow NFS if needed using common function
-    if [[ -n "${PROXMOX_NFS_SERVER}" ]]; then
-      set_firewall_rule "allow from ${PROXMOX_NFS_SERVER}"
-      echo "[$(date)] Allowed NFS server IP ${PROXMOX_NFS_SERVER} through UFW" >> "$LOGFILE"
-    fi
-
-    # Allow Samba if needed using common function
-    if [[ -n "${SMB_USER}" ]]; then
-      set_firewall_rule "allow samba"
-      echo "[$(date)] Allowed Samba traffic through UFW" >> "$LOGFILE"
-    fi
-  }
-
-  setup_firewall
+  echo "[$(date)] Configured firewall rules" >> "$LOGFILE"
 }
 
 # Main execution using common functions
 main() {
   check_root
+  setup_logging
   update_system
   configure_network
+  setup_firewall
 
   # Reboot system if not skipped
   if [[ $NO_REBOOT -eq 0 ]]; then

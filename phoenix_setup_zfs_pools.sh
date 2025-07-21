@@ -1,10 +1,10 @@
 #!/bin/bash
 
-# proxmox_setup_zfs_pools.sh
+# phoenix_setup_zfs_pools.sh
 # Configures ZFS pools on Proxmox VE
-# Version: 1.0.2
+# Version: 1.0.3
 # Author: Heads, Grok, Devstral
-# Usage: ./proxmox_setup_zfs_pools.sh [-d "data_drive"] [-l "log_drive"]
+# Usage: ./phoenix_setup_zfs_pools.sh [-d "data_drive"] [-l "log_drive"]
 # Note: Configure log rotation for $LOGFILE using /etc/logrotate.d/proxmox_setup
 
 # Source common functions and configuration variables
@@ -38,108 +38,58 @@ check_root() {
   fi
 }
 
-# Install ZFS packages using common functions
-install_zfs_packages() {
-  if ! check_package zfsutils-linux; then
-    retry_command "apt-get update && apt-get install -y zfsutils-linux"
-    echo "[$(date)] Installed ZFS utilities" >> "$LOGFILE"
-  fi
-}
+# Initialize logging for consistent behavior
+setup_logging
 
-# Check for available drives and prompt user if needed using common functions
+# Check if data and log drives are specified, and verify they're not in use by another pool
 check_available_drives() {
-  echo "Checking available disks..." | tee -a "$LOGFILE"
+  local drive="$1"
 
-  # List unpartitioned or unused disks
-  lsblk_output=$(lsblk -no NAME,TYPE,SIZE,MODEL -e 7,11)
-  echo "$lsblk_output" >> "$LOGFILE"
-  while read -r line; do
-    if [[ $line == *"disk"* && ! $line =~ "vda\|vdb\|vd*" ]]; then
-      disk_name=$(echo $line | awk '{print $1}')
-      echo "Found available disk: /dev/$disk_name" | tee -a "$LOGFILE"
-      if [[ -z "$DATA_DRIVE" ]]; then
-        read -p "Use this as data drive (y/n)? " response
-        case $response in
-          [Yy]* )
-            DATA_DRIVE="/dev/$disk_name"
-            ;;
-          * )
-            echo "Skipping disk /dev/$disk_name" | tee -a "$LOGFILE"
-            ;;
-        esac
-      fi
-
-      if [[ -z "$LOG_DRIVE" ]]; then
-        read -p "Use this as log drive (y/n)? " response
-        case $response in
-          [Yy]* )
-            LOG_DRIVE="/dev/$disk_name"
-            ;;
-          * )
-            echo "Skipping disk /dev/$disk_name" | tee -a "$LOGFILE"
-            ;;
-        esac
-      fi
-
-      # If both drives are selected, break out of loop using common functions
-      if [[ ! -z "$DATA_DRIVE" && ! -z "$LOG_DRIVE" ]]; then
-        break
-      fi
-    fi
-  done <<< "$lsblk_output"
-
-  # Ensure drives were selected using common functions
-  if [[ -z "$DATA_DRIVE" || -z "$LOG_DRIVE" ]]; then
-    echo "Error: Both data and log drives must be specified." | tee -a "$LOGFILE"
+  # Only exclude common system disks (sda and vda) to avoid excluding potentially valid disks
+  if [[ "$drive" =~ ^(sd[a-z]|vd[a-z])$ ]]; then
+    echo "Error: Drive $drive is either a system disk or invalid." | tee -a "$LOGFILE"
     exit 1
   fi
+
+  # Check if the drive is already in use by another ZFS pool using zpool status
+  if lsblk -o MOUNTPOINT | grep -q "/$drive"; then
+    echo "Error: Drive $drive appears to be mounted or in use." | tee -a "$LOGFILE"
+    exit 1
+  fi
+
+  # Verify the drive isn't part of an existing ZFS pool (avoid improper piping)
+  if zpool status | grep -q "^[[:space:]]*$drive "; then
+    echo "Error: Drive $drive is already in use by another ZFS pool." | tee -a "$LOGFILE"
+    exit 1
+  fi
+
+  echo "[$(date)] Verified that drive $drive is available for use" >> "$LOGFILE"
 }
 
-# Create ZFS pools using common functions
+# Create a ZFS pool and datasets using common functions
 create_zfs_pools() {
   local pool_name="rpool"
 
-  # Check if the pool already exists using common function
   if zfs_pool_exists "$pool_name"; then
     echo "Pool $pool_name already exists, skipping creation." | tee -a "$LOGFILE"
   else
     retry_command "zpool create -f $pool_name $DATA_DRIVE"
     echo "[$(date)] Created ZFS pool: $pool_name on $DATA_DRIVE" >> "$LOGFILE"
 
-    # Create log device if specified and not already attached to a pool using common function
-    if [[ ! -z "$LOG_DRIVE" && ! zfs_pool_exists | grep -qv "^$pool_name\s" ]]; then
+    # Add a log device if specified and it's not already in use by another pool
+    if [[ -n "$LOG_DRIVE" ]]; then
+      check_available_drives "$LOG_DRIVE"
       retry_command "zpool add $pool_name log $LOG_DRIVE"
       echo "[$(date)] Added log device: $LOG_DRIVE to pool: $pool_name" >> "$LOGFILE"
     fi
 
-    # Create datasets for the pool using common function
-    create_zfs_datasets() {
-      local dataset_list=("shared-prod-data" "shared-prod-data-sync" "shared-test-data" "shared-test-data-sync" "backups" "iso" "bulk-data")
+    # Create datasets for the pool using the ZFS_DATASET_LIST from phoenix_config.sh
+    mkdir -p /mnt/pve || { echo "Error: Failed to create /mnt/pve directory." | tee -a "$LOGFILE"; exit 1; }
 
-      for dataset in "${dataset_list[@]}"; do
-        retry_command "zfs create -o mountpoint=/mnt/pve/$dataset $pool_name/$dataset"
-        echo "[$(date)] Created ZFS dataset: $pool_name/$dataset with mountpoint /mnt/pve/$dataset" >> "$LOGFILE"
-      done
-    }
-
-    create_zfs_datasets
-  fi
-
-  # Create another pool for NFS if needed using common function
-  local nfs_pool="quickOS"
-
-  if zfs_pool_exists "$nfs_pool"; then
-    echo "Pool $nfs_pool already exists, skipping creation." | tee -a "$LOGFILE"
-  else
-    retry_command "zpool create -f $nfs_pool $DATA_DRIVE"
-    echo "[$(date)] Created ZFS pool: $nfs_pool on $DATA_DRIVE" >> "$LOGFILE"
-
-    # Create datasets for the NFS pool using common function
-    local nfs_dataset_list=("shared-prod-data" "shared-prod-data-sync")
-
-    for dataset in "${nfs_dataset_list[@]}"; do
-      retry_command "zfs create -o mountpoint=/quickOS/$dataset $nfs_pool/$dataset"
-      echo "[$(date)] Created ZFS dataset: $nfs_pool/$dataset with mountpoint /quickOS/$dataset" >> "$LOGFILE"
+    IFS=',' read -r -a datasets <<< "$ZFS_DATASET_LIST"
+    for dataset in "${datasets[@]}"; do
+      create_zfs_dataset "$pool_name" "$dataset" "/mnt/pve/$dataset"
+      echo "[$(date)] Created ZFS dataset: $pool_name/$dataset with mountpoint /mnt/pve/$dataset" >> "$LOGFILE"
     done
   fi
 }
@@ -147,9 +97,23 @@ create_zfs_pools() {
 # Main execution using common functions
 main() {
   check_root
+  setup_logging
+
+  if [[ -z "$DATA_DRIVE" ]]; then
+    read -p "Enter the data drive for ZFS pool (e.g., sdb): " DATA_DRIVE
+  fi
+
+  check_available_drives "$DATA_DRIVE"
+
+  # Prompt for log drive only if not provided in command-line arguments
+  if [[ -z "$LOG_DRIVE" ]]; then
+    read -p "Enter the log drive for ZFS pool (optional, e.g., sdc): " LOG_DRIVE
+  fi
+
   install_zfs_packages
-  check_available_drives
   create_zfs_pools
+
+  echo "[$(date)] Completed ZFS pool setup with $pool_name" >> "$LOGFILE"
 }
 
 main

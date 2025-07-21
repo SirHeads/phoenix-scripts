@@ -1,10 +1,10 @@
 #!/bin/bash
 
-# proxmox_setup_zfs_datasets.sh
+# phoenix_setup_zfs_datasets.sh
 # Configures ZFS datasets on Proxmox VE
-# Version: 1.0.2
+# Version: 1.0.3
 # Author: Heads, Grok, Devstral
-# Usage: ./proxmox_setup_zfs_datasets.sh [-p "pool_name"] [-d "dataset_list"]
+# Usage: ./phoenix_setup_zfs_datasets.sh [-p "pool_name"] [-d "dataset_list"]
 # Note: Configure log rotation for $LOGFILE using /etc/logrotate.d/proxmox_setup
 
 # Source common functions and configuration variables
@@ -38,61 +38,69 @@ check_root() {
   fi
 }
 
-# Install ZFS packages using common functions
-install_zfs_packages() {
-  if ! check_package zfsutils-linux; then
-    retry_command "apt-get update && apt-get install -y zfsutils-linux"
-    echo "[$(date)] Installed ZFS utilities" >> "$LOGFILE"
-  fi
-}
+# Initialize logging for consistent behavior
+setup_logging
 
-# Check if pool exists or create it using common function
-check_or_create_pool() {
-  local pool_name="$1"
+# Check if pool exists using common functions (default to rpool if not specified)
+check_pool() {
+  local pool_name="${POOL_NAME:-rpool}"
 
-  # Check if the pool already exists using common functions
+  # Verify the ZFS pool existence with common function
   if ! zfs_pool_exists "$pool_name"; then
-    echo "Pool $pool_name does not exist. Please specify an existing pool." | tee -a "$LOGFILE"
+    echo "Error: Pool $pool_name does not exist. Please specify an existing pool." | tee -a "$LOGFILE"
     exit 1
   fi
 
-  echo "Using ZFS pool: $pool_name" >> "$LOGFILE"
+  echo "[$(date)] Using ZFS pool: $pool_name" >> "$LOGFILE"
 }
 
-# Create ZFS datasets using common functions
+# Create ZFS datasets using common functions (default to ZFS_DATASET_LIST if not specified)
 create_zfs_datasets() {
-  local pool_name="$1"
-  local dataset_list="$2"
+  local pool_name="${POOL_NAME:-rpool}"
+  local dataset_list="${DATASET_LIST:-$ZFS_DATASET_LIST}"
 
-  # Convert comma-separated list to array
+  # Ensure the dataset list is provided and not empty
+  if [[ -z "$dataset_list" ]]; then
+    echo "Error: Dataset list is empty. Please specify datasets via -d or define ZFS_DATASET_LIST in phoenix_config.sh." | tee -a "$LOGFILE"
+    exit 1
+  fi
+
+  # Parse the comma-separated dataset list and validate each name before creating
   IFS=',' read -r -a datasets <<< "$dataset_list"
-
   for dataset in "${datasets[@]}"; do
-    # Check if the dataset already exists using common function
-    if zfs_dataset_exists "$pool_name/$dataset"; then
-      echo "Dataset $pool_name/$dataset already exists, skipping creation." | tee -a "$LOGFILE"
-      continue
+    if [[ ! "$dataset" =~ ^[a-zA-Z0-9][a-zA-Z0-9_-]*$ ]]; then
+      echo "Error: Invalid dataset name: $dataset (must contain only letters, numbers, hyphens, or underscores)" | tee -a "$LOGFILE"
+      exit 1
     fi
 
-    # Create the ZFS dataset with mountpoint using common functions
-    retry_command "zfs create -o mountpoint=/mnt/pve/$dataset $pool_name/$dataset"
-    echo "[$(date)] Created ZFS dataset: $pool_name/$dataset" >> "$LOGFILE"
+    # Ensure the /mnt/pve parent directory exists before creating datasets
+    mkdir -p /mnt/pve || { echo "Error: Failed to create /mnt/pve" | tee -a "$LOGFILE"; exit 1; }
+
+    if ! zfs_dataset_exists "$pool_name/$dataset"; then
+      # Use the common function for dataset creation with validation and error handling
+      create_zfs_dataset "$pool_name" "$dataset" "/mnt/pve/$dataset"
+      echo "[$(date)] Created ZFS dataset: $pool_name/$dataset with mountpoint /mnt/pve/$dataset" >> "$LOGFILE"
+    else
+      echo "Dataset $pool_name/$dataset already exists, skipping creation." | tee -a "$LOGFILE"
+    fi
   done
 }
 
 # Main execution using common functions
 main() {
   check_root
-  install_zfs_packages
+  setup_logging
 
-  # Ensure pool name and dataset list are specified using common function
-  if [[ -z "$POOL_NAME" || -z "$DATASET_LIST" ]]; then
-    echo "Error: Pool name (-p) and dataset list (-d) must be specified." | tee -a "$LOGFILE"
-    exit 1
-  fi
+  # Default pool name to rpool if not specified
+  POOL_NAME="${POOL_NAME:-rpool}"
 
-  check_or_create_pool "$POOL_NAME"
-  create_zfs_datasets "$POOL_NAME" "$DATASET_LIST"
+  # Check the existence of the specified pool (or default rpool)
+  check_pool "$POOL_NAME"
+
+  # Create ZFS datasets using either user-provided list or default from phoenix_config.sh
+  create_zfs_datasets "${POOL_NAME}" "${DATASET_LIST:-$ZFS_DATASET_LIST}"
+
+  echo "[$(date)] Completed ZFS dataset setup" >> "$LOGFILE"
 }
 
 main

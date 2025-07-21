@@ -2,7 +2,7 @@
 
 # common.sh
 # Shared functions for Proxmox VE setup scripts
-# Version: 1.2.0
+# Version: 1.2.2
 # Author: Heads, Grok, Devstral
 # Usage: Source this script in other setup scripts to use common functions
 # Note: Configure log rotation for $LOGFILE using /etc/logrotate.d/proxmox_setup
@@ -28,87 +28,27 @@ check_root() {
   fi
 }
 
-# Retry a command up to 3 times with delay, capturing error output
-retry_command() {
-  local cmd="$1"
-  local retries=3
-  local delay=5
-  local count=0
-  local error_output
-
-  until error_output=$(eval "$cmd" 2>&1 >> "$LOGFILE"); do
-    count=$((count + 1))
-    if [[ $count -ge $retries ]]; then
-      echo "Error: Command failed after $retries attempts: $cmd" | tee -a "$LOGFILE"
-      echo "Error output: $error_output" | tee -a "$LOGFILE"
-      exit 1
-    fi
-    echo "Warning: Command failed, retrying ($count/$retries)... Error: $error_output" | tee -a "$LOGFILE"
-    sleep "$delay"
-  done
-  echo "[$(date)] Successfully executed: $cmd" >> "$LOGFILE"
-}
-
-# Check if a package is installed
-check_package() {
-  local package="$1"
-  if dpkg -l | grep -q "$package"; then
-    echo "Package $package already installed, skipping" | tee -a "$LOGFILE"
-    return 0
-  fi
-  return 1
-}
-
 # Initialize logging
 setup_logging
 
-# Check if ZFS pool exists
-zfs_pool_exists() {
-  local pool="$1"
-  if zpool list -H -o name | grep -q "^$pool$"; then
-    return 0
-  fi
-  return 1
+# Check network connectivity to a server
+check_network_connectivity() {
+  local server="$1"
+  ping -c 1 "$server" >/dev/null 2>&1 || { echo "Error: Cannot reach $server" | tee -a "$LOGFILE"; exit 1; }
+  echo "[$(date)] Network connectivity to $server verified" >> "$LOGFILE"
 }
 
-# Create ZFS dataset
-create_zfs_dataset() {
-  local pool="$1"
-  local dataset="$2"
-  local mountpoint="$3"
-
-  if zfs list -H -o name | grep -q "^$pool/$dataset$"; then
-    echo "Dataset $pool/$dataset already exists, skipping creation" | tee -a "$LOGFILE"
-    return 0
-  fi
-
-  zfs create -o mountpoint=$mountpoint $pool/$dataset || {
-    echo "Error: Failed to create $pool/$dataset dataset" | tee -a "$LOGFILE"
-    exit 1
-  }
+# Check if an interface has an IP in the specified subnet
+check_interface_in_subnet() {
+  local subnet="$1"
+  ip addr | grep -q "$subnet" || { echo "Error: No interface in subnet $subnet" | tee -a "$LOGFILE"; exit 1; }
+  echo "[$(date)] Interface in subnet $subnet verified" >> "$LOGFILE"
 }
 
-# Set firewall rule using UFW
-set_firewall_rule() {
-  local rule="$1"
-  if ! ufw $rule; then
-    echo "Failed to set firewall rule: $rule" | tee -a "$LOGFILE"
-    exit 1
-  fi
-}
-
-# Check if a port is listening
-port_is_listening() {
-  local port="$1"
-  local proto="$2"
-
-  if [[ "$proto" = "udp" ]]; then
-    ss -uln | grep -q ":$port "
-  else
-    ss -tln | grep -q ":$port "
-  fi
-
-  return $?
+# Check internet connectivity
+check_internet_connectivity() {
+  ping -c 1 8.8.8.8 >/dev/null 2>&1 || { echo "Warning: No internet connectivity" | tee -a "$LOGFILE"; }
+  echo "[$(date)] Internet connectivity check completed" >> "$LOGFILE"
 }
 
 # Add user to a group
@@ -130,4 +70,77 @@ verify_nfs_exports() {
     echo "Error: Failed to verify NFS exports" | tee -a "$LOGFILE"
     exit 1
   fi
+
+  # Additional verification logic can be added here as needed
+}
+
+# Check if a ZFS pool exists using common functions
+zfs_pool_exists() {
+  local pool="$1"
+  if zpool list -H -o name | grep -q "^$pool$"; then
+    return 0
+  fi
+  return 1
+}
+
+# Check if a ZFS dataset exists using zfs list -H -o name
+zfs_dataset_exists() {
+  local dataset="$1"
+  if zfs list -H -o name | grep -q "^$dataset$"; then
+    return 0
+  fi
+  return 1
+}
+
+# Create ZFS dataset with mount point validation and error handling
+create_zfs_dataset() {
+  local pool="$1"
+  local dataset="$2"
+  local mountpoint="$3"
+
+  if zfs list -H -o name | grep -q "^$pool/$dataset$"; then
+    echo "Dataset $pool/$dataset already exists, skipping creation" | tee -a "$LOGFILE"
+    return 0
+  fi
+
+  # Create the dataset with mount point
+  zfs create -o mountpoint=$mountpoint "$pool/$dataset" || {
+    echo "Error: Failed to create ZFS dataset $pool/$dataset with mountpoint $mountpoint" | tee -a "$LOGFILE"
+    exit 1
+  }
+
+  # Verify the dataset was created successfully
+  if ! zfs list -H -o name | grep -q "^$pool/$dataset$"; then
+    echo "Error: Failed to verify ZFS dataset creation for $pool/$dataset" | tee -a "$LOGFILE"
+    exit 1
+  fi
+
+  echo "[$(date)] Successfully created ZFS dataset: $pool/$dataset with mountpoint $mountpoint" >> "$LOGFILE"
+}
+
+# Retry a command multiple times before giving up (common function for robustness)
+retry_command() {
+  local cmd="$@"
+  local max_attempts=3
+  local attempt=0
+
+  while [ $attempt -lt $max_attempts ]; do
+    echo "[$(date)] Attempting: $cmd" >> "$LOGFILE"
+    eval "$cmd"
+    if [[ $? -eq 0 ]]; then
+      return 0
+    fi
+    attempt=$((attempt + 1))
+    sleep 5
+  done
+
+  echo "Error: Command failed after $max_attempts attempts: $cmd" | tee -a "$LOGFILE"
+  exit 1
+}
+
+# Check if a package is installed (common function for package management)
+check_package() {
+  local pkg="$1"
+
+  dpkg-query -W -f='${Status}' "$pkg" 2>/dev/null | grep "install ok installed" >/dev/null
 }

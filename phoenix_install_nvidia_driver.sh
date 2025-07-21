@@ -2,7 +2,7 @@
 
 # phoenix_install_nvidia_driver.sh
 # Installs NVIDIA drivers on Proxmox VE
-# Version: 1.0.3
+# Version: 1.0.4
 # Author: Heads, Grok, Devstral
 # Usage: ./phoenix_install_nvidia_driver.sh [--no-reboot]
 # Note: Configure log rotation for $LOGFILE using /etc/logrotate.d/proxmox_setup
@@ -35,107 +35,96 @@ check_root() {
   fi
 }
 
-# Blacklist nouveau driver
-blacklist_nouveau() {
-  if ! grep -q "blacklist nouveau" /etc/modprobe.d/blacklist.conf; then
-    echo "blacklist nouveau" >> /etc/modprobe.d/blacklist.conf || { echo "Error: Failed to blacklist nouveau"; exit 1; }
-    echo "options nouveau modeset=0" >> /etc/modprobe.d/blacklist.conf || { echo "Error: Failed to add options for nouveau"; exit 1; }
-  fi
-}
+# Initialize logging
+setup_logging
 
-# Install Proxmox VE headers using common functions
-install_pve_headers() {
-  if ! check_package pve-headers; then
-    retry_command "apt-get update && apt-get install -y pve-headers"
-    echo "[$(date)] Installed pve-headers" >> "$LOGFILE"
-  fi
-}
-
-# Add NVIDIA repository using common functions
-add_nvidia_repo() {
-  local repo_line="deb http://developer.download.nvidia.com/compute/cuda/repos/ubuntu$(lsb_release -sr | tr -d .)/x86_64/ /"
-  if ! grep -q nvidia /etc/apt/sources.list.d/nvidia.list; then
-    echo "$repo_line" > /etc/apt/sources.list.d/nvidia.list || { echo "Error: Failed to add NVIDIA repository"; exit 1; }
-    retry_command "apt-key adv --fetch-keys http://developer.download.nvidia.com/compute/cuda/repos/ubuntu$(lsb_release -sr | tr -d .)/x86_64/7fa2af80.pub"
-    retry_command "apt-get update"
-  fi
-}
-
-# Install NVIDIA drivers and nvtop using common functions
-install_nvidia_driver() {
-  retry_command "apt-get update"
-  if ! check_package nvidia-driver-assistant; then
-    echo "Installing nvidia-driver-assistant and nvtop, this may take a while..." | tee -a "$LOGFILE"
-    retry_command "apt-get install -y nvidia-driver-assistant nvtop"
-    echo "[$(date)] Installed nvidia-driver-assistant and nvtop" >> "$LOGFILE"
-  fi
-  retry_command "nvidia-driver-assistant"
-  if ! check_package nvidia-open; then
-    retry_command "apt-get install -Vy nvidia-open"
-    echo "[$(date)] Installed nvidia-open driver" >> "$LOGFILE"
-  fi
-}
-
-# Verify NVIDIA driver installation using common functions
-verify_nvidia_installation() {
-  if command -v nvidia-smi >/dev/null 2>&1; then
-    local nvidia_smi_output
-    nvidia_smi_output=$(nvidia-smi 2>&1)
-    if [[ $? -eq 0 ]]; then
-      echo "[$(date)] NVIDIA driver verification successful" >> "$LOGFILE"
-      echo "$nvidia_smi_output" >> "$LOGFILE"
-    else
-      echo "Error: nvidia-smi failed: $nvidia_smi_output" | tee -a "$LOGFILE"
-      exit 1
-    fi
-  else
-    echo "Error: nvidia-smi command not found after driver installation" | tee -a "$LOGFILE"
+# Check for NVIDIA GPU presence using lspci
+check_nvidia_gpu() {
+  if ! lspci | grep -i nvidia > /dev/null; then
+    echo "Error: No NVIDIA GPU found on this system." | tee -a "$LOGFILE"
     exit 1
   fi
 }
 
-# Update initramfs using common functions
-update_initramfs() {
-  retry_command "update-initramfs -u"
-  echo "[$(date)] Updated initramfs" >> "$LOGFILE"
+# Add the NVIDIA repository using a static URL for Debian 12-based Proxmox VE
+add_nvidia_repo() {
+  local repo_line="deb http://developer.download.nvidia.com/compute/cuda/repos/debian12/x86_64/ /"
+  if ! grep -q nvidia /etc/apt/sources.list.d/nvidia.list; then
+    echo "$repo_line" > /etc/apt/sources.list.d/nvidia.list || { echo "Error: Failed to add NVIDIA repository" | tee -a "$LOGFILE"; exit 1; }
+    retry_command "apt-key adv --fetch-keys http://developer.download.nvidia.com/compute/cuda/repos/debian12/x86_64/7fa2af80.pub"
+    retry_command "apt-get update"
+  fi
+  echo "[$(date)] Added NVIDIA repository" >> "$LOGFILE"
 }
 
-# Main execution
-main() {
-  check_root
-  blacklist_nouveau
-  install_pve_headers
-  add_nvidia_repo
-  install_nvidia_driver
-  verify_nvidia_installation
-  update_initramfs
+# Install the NVIDIA driver and related packages
+install_nvidia_driver() {
+  retry_command "apt-get update"
 
-  echo "NVIDIA driver installation and verification complete."
+  if ! check_package nvidia-driver; then
+    echo "Installing NVIDIA driver and tools, this may take a while..." | tee -a "$LOGFILE"
+    retry_command "apt-get install -y nvidia-driver nvtop"
+    echo "[$(date)] Installed NVIDIA driver and tools" >> "$LOGFILE"
+  fi
+
+  if ! check_package nvidia-open; then
+    retry_command "apt-get install -Vy nvidia-open"
+    echo "[$(date)] Installed NVIDIA OpenGL driver" >> "$LOGFILE"
+  fi
+}
+
+# Verify the NVIDIA installation by checking module loading and nvidia-smi command
+verify_nvidia_installation() {
+  if ! lsmod | grep -q "^nvidia"; then
+    echo "Error: NVIDIA kernel module is not loaded." | tee -a "$LOGFILE"
+    exit 1
+  fi
+
+  if ! nvidia-smi; then
+    echo "Error: Failed to run nvidia-smi. Driver installation may be incomplete or incorrect." | tee -a "$LOGFILE"
+    exit 1
+  fi
+
+  echo "[$(date)] NVIDIA driver installation verified" >> "$LOGFILE"
+}
+
+# Ensure kernel compatibility by updating system packages and headers (unless --no-reboot is specified)
+ensure_kernel_compatibility() {
   if [[ $NO_REBOOT -eq 0 ]]; then
-    read -t 60 -p "NVIDIA driver installation verified. Would you like to update the system to the latest version and ensure driver compatibility with the latest kernel? This will update packages, install kernel headers, rebuild the driver, and reboot (y/n) [Timeout in 60s]: " UPDATE_CONFIRMATION
+    read -t 60 -p "Update system to ensure driver compatibility with the latest kernel? This will update packages, install kernel headers, rebuild the driver, and reboot (y/n) [Timeout in 60s]: " UPDATE_CONFIRMATION
+
     if [[ "$UPDATE_CONFIRMATION" == "y" || "$UPDATE_CONFIRMATION" == "Y" ]]; then
       echo "Updating system and ensuring driver compatibility..." | tee -a "$LOGFILE"
       retry_command "apt-get update"
       retry_command "apt-get upgrade -y"
       retry_command "apt-get install -y pve-headers"
       retry_command "dkms autoinstall"
-      echo "[$(date)] System updated, headers installed, and driver rebuilt" >> "$LOGFILE"
 
-      read -t 60 -p "Reboot now to apply changes? (y/n) [Timeout in 60s]: " REBOOT_CONFIRMATION
-      if [[ "$REBOOT_CONFIRMATION" == "y" || "$REBOOT_CONFIRMATION" == "Y" ]]; then
-        echo "Rebooting system..."
-        reboot
-      else
-        echo "Please reboot manually to apply changes."
+      if ! dkms status; then
+        echo "Error: DKMS failed to rebuild the NVIDIA driver." | tee -a "$LOGFILE"
+        exit 1
       fi
+
+      echo "[$(date)] System updated, headers installed, and driver rebuilt" >> "$LOGFILE"
     else
-      echo "Skipping system update and kernel compatibility check. Please ensure the NVIDIA driver is compatible with your current kernel version."
+      echo "Skipping system update for kernel compatibility." >> "$LOGFILE"
     fi
   else
-    echo "Reboot skipped due to --no-reboot flag. Please reboot manually."
+    echo "Skipped kernel compatibility checks due to --no-reboot flag." >> "$LOGFILE"
   fi
+}
 
-  echo "[$(date)] Completed proxmox_install_nvidia_driver.sh" >> "$LOGFILE"
+# Main execution using common functions
+main() {
+  check_root
+  setup_logging
+  check_nvidia_gpu
+  add_nvidia_repo
+  install_nvidia_driver
+  verify_nvidia_installation
+
+  # Ensure kernel compatibility if not skipped by --no-reboot flag
+  ensure_kernel_compatibility
 }
 
 main
