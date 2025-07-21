@@ -2,9 +2,9 @@
 
 # phoenix_setup_zfs_datasets.sh
 # Configures ZFS datasets on Proxmox VE
-# Version: 1.0.3
+# Version: 1.0.4
 # Author: Heads, Grok, Devstral
-# Usage: ./phoenix_setup_zfs_datasets.sh [-p "pool_name"] [-d "dataset_list"]
+# Usage: ./phoenix_setup_zfs_datasets.sh [-q "quickos_dataset_list"] [-f "fastdata_dataset_list"]
 # Note: Configure log rotation for $LOGFILE using /etc/logrotate.d/proxmox_setup
 
 # Source common functions and configuration variables
@@ -13,18 +13,20 @@ source /usr/local/bin/phoenix_config.sh || { echo "Error: Failed to source phoen
 load_config
 
 # Parse command-line arguments
-while [[ $# -gt 0 ]]; do
-  case $1 in
-    -p)
-      POOL_NAME="$2"
-      shift 2
+while getopts ":q:f:" opt; do
+  case ${opt} in
+    q )
+      QUICKOS_DATASET_LIST=($OPTARG)
       ;;
-    -d)
-      DATASET_LIST="$2"
-      shift 2
+    f )
+      FASTDATA_DATASET_LIST=($OPTARG)
       ;;
-    *)
-      echo "Error: Unknown option $1" | tee -a "$LOGFILE"
+    \? )
+      echo "Invalid option: $OPTARG" | tee -a "$LOGFILE"
+      exit 1
+      ;;
+    : )
+      echo "Option -$OPTARG requires an argument." | tee -a "$LOGFILE"
       exit 1
       ;;
   esac
@@ -38,50 +40,82 @@ check_root() {
   fi
 }
 
+# Check for pvesm availability
+check_pvesm() {
+  if ! command -v pvesm >/dev/null 2>&1; then
+    echo "Error: pvesm command not found. Ensure this script is running on a Proxmox VE system." | tee -a "$LOGFILE"
+    exit 1
+  fi
+  echo "[$(date)] Verified pvesm availability" >> "$LOGFILE"
+}
+
 # Initialize logging for consistent behavior
 setup_logging
 
-# Check if pool exists using common functions (default to rpool if not specified)
-check_pool() {
-  local pool_name="${POOL_NAME:-rpool}"
+# Create datasets for quickOS pool using common functions
+create_quickos_datasets() {
+  local pool="$QUICKOS_POOL"
+  local datasets=("${QUICKOS_DATASET_LIST[@]}")
 
-  # Verify the ZFS pool existence with common function
-  if ! zfs_pool_exists "$pool_name"; then
-    echo "Error: Pool $pool_name does not exist. Please specify an existing pool." | tee -a "$LOGFILE"
+  # Create datasets only if the pool exists
+  if zfs_pool_exists "$pool"; then
+    for dataset in "${datasets[@]}"; do
+      local mountpoint="$MOUNT_POINT_BASE/$dataset"
+
+      # Create ZFS dataset if it doesn't exist
+      if ! zfs list -H -o name | grep -q "^$pool/$dataset$"; then
+        create_zfs_dataset "$pool" "$dataset" "$mountpoint" -o compression=lz4 -o atime=off
+        echo "[$(date)] Created ZFS dataset: $pool/$dataset with mountpoint $mountpoint" >> "$LOGFILE"
+      else
+        echo "[$(date)] ZFS dataset $pool/$dataset already exists, skipping creation" >> "$LOGFILE"
+      fi
+    done
+  else
+    echo "Error: Pool $pool does not exist." | tee -a "$LOGFILE"
     exit 1
   fi
-
-  echo "[$(date)] Using ZFS pool: $pool_name" >> "$LOGFILE"
 }
 
-# Create ZFS datasets using common functions (default to ZFS_DATASET_LIST if not specified)
-create_zfs_datasets() {
-  local pool_name="${POOL_NAME:-rpool}"
-  local dataset_list="${DATASET_LIST:-$ZFS_DATASET_LIST}"
+# Create datasets for fastData pool using common functions
+create_fastdata_datasets() {
+  local pool="$FASTDATA_POOL"
+  local datasets=("${FASTDATA_DATASET_LIST[@]}")
 
-  # Ensure the dataset list is provided and not empty
-  if [[ -z "$dataset_list" ]]; then
-    echo "Error: Dataset list is empty. Please specify datasets via -d or define ZFS_DATASET_LIST in phoenix_config.sh." | tee -a "$LOGFILE"
+  # Create datasets only if the pool exists
+  if zfs_pool_exists "$pool"; then
+    for dataset in "${datasets[@]}"; do
+      local mountpoint="$MOUNT_POINT_BASE/$dataset"
+
+      # Create ZFS dataset if it doesn't exist
+      if ! zfs list -H -o name | grep -q "^$pool/$dataset$"; then
+        create_zfs_dataset "$pool" "$dataset" "$mountpoint" -o compression=lz4 -o atime=off
+        echo "[$(date)] Created ZFS dataset: $pool/$dataset with mountpoint $mountpoint" >> "$LOGFILE"
+      else
+        echo "[$(date)] ZFS dataset $pool/$dataset already exists, skipping creation" >> "$LOGFILE"
+      fi
+    done
+  else
+    echo "Error: Pool $pool does not exist." | tee -a "$LOGFILE"
     exit 1
   fi
+}
 
-  # Parse the comma-separated dataset list and validate each name before creating
-  IFS=',' read -r -a datasets <<< "$dataset_list"
+# Add datasets as Proxmox storage using common functions
+add_proxmox_storage() {
+  local pool="$1"
+  shift
+  local datasets=("$@")
+
+  # Check pvesm availability
+  check_pvesm
+
   for dataset in "${datasets[@]}"; do
-    if [[ ! "$dataset" =~ ^[a-zA-Z0-9][a-zA-Z0-9_-]*$ ]]; then
-      echo "Error: Invalid dataset name: $dataset (must contain only letters, numbers, hyphens, or underscores)" | tee -a "$LOGFILE"
-      exit 1
-    fi
-
-    # Ensure the /mnt/pve parent directory exists before creating datasets
-    mkdir -p /mnt/pve || { echo "Error: Failed to create /mnt/pve" | tee -a "$LOGFILE"; exit 1; }
-
-    if ! zfs_dataset_exists "$pool_name/$dataset"; then
-      # Use the common function for dataset creation with validation and error handling
-      create_zfs_dataset "$pool_name" "$dataset" "/mnt/pve/$dataset"
-      echo "[$(date)] Created ZFS dataset: $pool_name/$dataset with mountpoint /mnt/pve/$dataset" >> "$LOGFILE"
+    local storage_id=$(echo "$dataset" | tr '/' '-')
+    if ! pvesm status | grep -q "^$storage_id"; then
+      retry_command "pvesm add zfspool $storage_id -pool $pool/$dataset -content images"
+      echo "[$(date)] Added Proxmox storage: $storage_id for $pool/$dataset" >> "$LOGFILE"
     else
-      echo "Dataset $pool_name/$dataset already exists, skipping creation." | tee -a "$LOGFILE"
+      echo "[$(date)] Proxmox storage $storage_id already exists, skipping" >> "$LOGFILE"
     fi
   done
 }
@@ -91,14 +125,23 @@ main() {
   check_root
   setup_logging
 
-  # Default pool name to rpool if not specified
-  POOL_NAME="${POOL_NAME:-rpool}"
+  # Use environment variables or command-line arguments if set, otherwise fall back to config
+  if [[ -z "${QUICKOS_DATASET_LIST+x}" && -z "${OPTARG+x}" ]]; then
+    echo "[$(date)] Using QUICKOS_DATASET_LIST from phoenix_config.sh" >> "$LOGFILE"
+  else
+    echo "[$(date)] Using provided QUICKOS_DATASET_LIST: ${QUICKOS_DATASET_LIST[*]}" >> "$LOGFILE"
+  fi
 
-  # Check the existence of the specified pool (or default rpool)
-  check_pool "$POOL_NAME"
+  if [[ -z "${FASTDATA_DATASET_LIST+x}" && -z "${OPTARG+x}" ]]; then
+    echo "[$(date)] Using FASTDATA_DATASET_LIST from phoenix_config.sh" >> "$LOGFILE"
+  else
+    echo "[$(date)] Using provided FASTDATA_DATASET_LIST: ${FASTDATA_DATASET_LIST[*]}" >> "$LOGFILE"
+  fi
 
-  # Create ZFS datasets using either user-provided list or default from phoenix_config.sh
-  create_zfs_datasets "${POOL_NAME}" "${DATASET_LIST:-$ZFS_DATASET_LIST}"
+  create_quickos_datasets
+  create_fastdata_datasets
+  add_proxmox_storage "$QUICKOS_POOL" "${QUICKOS_DATASET_LIST[@]}"
+  add_proxmox_storage "$FASTDATA_POOL" "${FASTDATA_DATASET_LIST[@]}"
 
   echo "[$(date)] Completed ZFS dataset setup" >> "$LOGFILE"
 }

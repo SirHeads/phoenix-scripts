@@ -4,7 +4,7 @@
 # Installs and configures NFS server on Proxmox VE
 # Version: 1.0.4
 # Author: Heads, Grok, Devstral
-# Usage: ./phoenix_setup_nfs.sh
+# Usage: ./phoenix_setup_nfs.sh [-o "nfs_export_options"]
 # Note: Configure log rotation for $LOGFILE using /etc/logrotate.d/proxmox_setup
 
 # Source common functions and configuration variables
@@ -12,12 +12,39 @@ source /usr/local/bin/common.sh || { echo "Error: Failed to source common.sh"; e
 source /usr/local/bin/phoenix_config.sh || { echo "Error: Failed to source phoenix_config.sh"; exit 1; }
 load_config
 
+# Parse command-line arguments
+NFS_EXPORT_OPTIONS="rw,sync,no_subtree_check"
+while getopts ":o:" opt; do
+  case ${opt} in
+    o )
+      NFS_EXPORT_OPTIONS=$OPTARG
+      ;;
+    \? )
+      echo "Invalid option: $OPTARG" | tee -a "$LOGFILE"
+      exit 1
+      ;;
+    : )
+      echo "Option -$OPTARG requires an argument." | tee -a "$LOGFILE"
+      exit 1
+      ;;
+  esac
+done
+
 # Ensure script runs as root
 check_root() {
     if [[ $EUID -ne 0 ]]; then
         echo "Error: This script must be run as root." | tee -a "$LOGFILE"
         exit 1
     fi
+}
+
+# Check for pvesm availability
+check_pvesm() {
+    if ! command -v pvesm >/dev/null 2>&1; then
+        echo "Error: pvesm command not found. Ensure this script is running on a Proxmox VE system." | tee -a "$LOGFILE"
+        exit 1
+    fi
+    echo "[$(date)] Verified pvesm availability" >> "$LOGFILE"
 }
 
 # Initialize logging using the configuration setup_logging function
@@ -78,19 +105,14 @@ configure_nfs() {
         mountpoint="/mnt/pve/$dataset"
         mkdir -p "$mountpoint"
 
-        # Create ZFS datasets on rpool and quickOS pools
-        if ! zfs list -H -o name | grep -q "^rpool/$dataset$"; then
-            retry_command "zfs create -o mountpoint=$mountpoint rpool/$dataset"
-            echo "[$(date)] Created ZFS dataset: rpool/$dataset with mountpoint $mountpoint" >> "$LOGFILE"
-        fi
-
+        # Create ZFS datasets on quickOS pool only
         if ! zfs list -H -o name | grep -q "^quickOS/$dataset$"; then
             retry_command "zfs create -o mountpoint=$mountpoint quickOS/$dataset"
             echo "[$(date)] Created ZFS dataset: quickOS/$dataset with mountpoint $mountpoint" >> "$LOGFILE"
         fi
 
         # Add NFS exports for the datasets
-        export_line="$mountpoint ${NFS_SUBNET}(rw,sync,no_subtree_check)"
+        export_line="$mountpoint ${NFS_SUBNET}($NFS_EXPORT_OPTIONS)"
         if ! grep -q "^$export_line\$" /etc/exports; then
             echo "$export_line" >> /etc/exports || { echo "Error: Failed to update NFS exports." | tee -a "$LOGFILE"; exit 1; }
         fi
@@ -106,7 +128,7 @@ configure_nfs() {
         fi
     done
 
-    # Add Proxmox NFS storage using common functions (assuming pvesm is available)
+    # Add Proxmox NFS storage using common functions
     for dataset in "${nfs_datasets[@]}"; do
         retry_command "pvesm add nfs --server $PROXMOX_NFS_SERVER --share /mnt/pve/$dataset --content images"
         echo "[$(date)] Added Proxmox NFS storage: /mnt/pve/$dataset" >> "$LOGFILE"
@@ -138,6 +160,7 @@ verify_nfs_exports() {
 main() {
     check_root
     setup_logging
+    check_pvesm
     prompt_for_subnet
     install_prerequisites
     configure_nfs

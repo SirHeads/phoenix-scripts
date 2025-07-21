@@ -69,6 +69,7 @@ configure_ntp() {
 }
 
 disable_unnecessary_services() {
+  echo "Warning: Disabling pve-cluster.service may break Proxmox clustering features in a multi-node setup. Ensure this node is not part of a cluster or that clustering is not needed." | tee -a "$LOGFILE"
   retry_command "systemctl disable --now apparmor.service"
   retry_command "systemctl disable --now pve-cluster.service"
 
@@ -94,10 +95,24 @@ configure_network() {
   configure_static_ip() {
     read -p "Enter the network interface (e.g., ens18): " INTERFACE
     read -p "Enter the IP address for this server (e.g., 192.168.0.2/24): " IP_ADDRESS
+    read -p "Enter the gateway address (e.g., 192.168.0.1): " GATEWAY
+    read -p "Enter the DNS server address (e.g., 8.8.8.8): " DNS_SERVER
 
     # Validate IP address format
     if ! [[ "$IP_ADDRESS" =~ ^[0-9]{1,3}\.[0-9]{1,3}\.[0-9]{1,3}\.[0-9]{1,3}/[0-9]{1,2}$ ]]; then
       echo "Error: Invalid IP address format: $IP_ADDRESS" | tee -a "$LOGFILE"
+      exit 1
+    fi
+
+    # Validate gateway format
+    if ! [[ "$GATEWAY" =~ ^[0-9]{1,3}\.[0-9]{1,3}\.[0-9]{1,3}\.[0-9]{1,3}$ ]]; then
+      echo "Error: Invalid gateway address format: $GATEWAY" | tee -a "$LOGFILE"
+      exit 1
+    fi
+
+    # Validate DNS server format
+    if ! [[ "$DNS_SERVER" =~ ^[0-9]{1,3}\.[0-9]{1,3}\.[0-9]{1,3}\.[0-9]{1,3}$ ]]; then
+      echo "Error: Invalid DNS server address format: $DNS_SERVER" | tee -a "$LOGFILE"
       exit 1
     fi
 
@@ -109,11 +124,15 @@ configure_network() {
     cat << EOF > "/etc/network/interfaces.d/50-$INTERFACE.cfg"
 auto $INTERFACE
 iface $INTERFACE inet static
-address $IP_ADDRESS
+    address $IP_ADDRESS
+    gateway $GATEWAY
+    dns-nameservers $DNS_SERVER
 EOF
 
-    echo "[$(date)] Configured static IP for interface $INTERFACE with address $IP_ADDRESS" >> "$LOGFILE"
+    echo "[$(date)] Configured static IP for interface $INTERFACE with address $IP_ADDRESS, gateway $GATEWAY, and DNS $DNS_SERVER" >> "$LOGFILE"
   }
+
+  configure_static_ip
 }
 
 update_hosts_file() {
@@ -128,6 +147,7 @@ update_hosts_file() {
 setup_firewall() {
   # Allow Proxmox VE services through the firewall
   retry_command "ufw allow OpenSSH"
+  retry_command "ufw allow 8006/tcp"  # Proxmox VE web UI
 
   # Check for Samba installation before applying firewall rule
   if check_package samba; then
@@ -157,10 +177,10 @@ main() {
       echo "[$(date)] Rebooting system to apply changes." >> "$LOGFILE"
       reboot
     else
-      echo "[$(date)] Skipping reboot. Please reboot manually to apply all changes." >> "$LOGFILE"
+      echo "[$(date)] Skipping reboot. Please reboot manually to apply all changes." | tee -a "$LOGFILE"
     fi
   else
-    echo "[$(date)] Skipped reboot due to --no-reboot flag." >> "$LOGFILE"
+    echo "[$(date)] Skipped reboot due to --no-reboot flag." | tee -a "$LOGFILE"
   fi
 
   echo "[$(date)] Completed initial Proxmox VE setup" >> "$LOGFILE"

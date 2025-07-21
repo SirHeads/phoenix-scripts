@@ -12,7 +12,7 @@ source /usr/local/bin/common.sh || { echo "Error: Failed to source common.sh"; e
 source /usr/local/bin/phoenix_config.sh || { echo "Error: Failed to source phoenix_config.sh"; exit 1; }
 load_config
 
-# Parse command-line arguments (removed --no-ssl option)
+# Parse command-line arguments
 NETWORK_NAME=""
 while [[ $# -gt 0 ]]; do
   case $1 in
@@ -91,7 +91,20 @@ configure_samba() {
   local datasets=("shared-prod-data" "shared-prod-data-sync" "shared-backups")
   for dataset in "${datasets[@]}"; do
     mkdir -p "$MOUNT_POINT_BASE/$dataset" || { echo "Error: Failed to create $MOUNT_POINT_BASE/$dataset." | tee -a "$LOGFILE"; exit 1; }
+    # Create ZFS dataset for shared-backups if it doesn't exist
+    if [[ "$dataset" == "shared-backups" ]] && ! zfs list -H -o name | grep -q "^quickOS/$dataset$"; then
+      create_zfs_dataset "quickOS" "$dataset" "$MOUNT_POINT_BASE/$dataset" -o compression=lz4 -o atime=off
+    fi
   done
+
+  # Back up existing smb.conf if it exists
+  if [[ -f /etc/samba/smb.conf ]]; then
+    cp /etc/samba/smb.conf "/etc/samba/smb.conf.bak.$(date +%F_%H-%M-%S)" || {
+      echo "Error: Failed to back up /etc/samba/smb.conf" | tee -a "$LOGFILE"
+      exit 1
+    }
+    echo "[$(date)] Backed up /etc/samba/smb.conf" >> "$LOGFILE"
+  fi
 
   # Configure Samba global settings and shares in /etc/samba/smb.conf
   cat << EOF > /etc/samba/smb.conf
@@ -142,9 +155,9 @@ EOF
   # Check firewall rules before applying, avoiding redundancy with other scripts like phoenix_proxmox_initial_setup.sh
   if ! ufw status | grep -q "137/udp ALLOW Anywhere"; then
     retry_command "ufw allow Samba"
-    echo "[$(date)] Updated firewall to allow Samba traffic" >> "$LOGFILE"
+    echo "[$(date)] Updated firewall to allow Samba traffic" | tee -a "$LOGFILE"
   else
-    echo "[$(date)] Samba firewall rules already set, skipping." >> "$LOGFILE"
+    echo "[$(date)] Samba firewall rules already set, skipping." | tee -a "$LOGFILE"
   fi
 }
 

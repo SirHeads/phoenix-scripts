@@ -46,6 +46,35 @@ check_nvidia_gpu() {
   fi
 }
 
+# Check Proxmox VE version compatibility
+check_proxmox_version() {
+  if ! command -v pveversion >/dev/null 2>&1; then
+    echo "Error: pveversion command not found. Ensure this script is running on a Proxmox VE system." | tee -a "$LOGFILE"
+    exit 1
+  fi
+
+  # Check Debian version (Proxmox VE 8.x is based on Debian 12)
+  if [[ -f /etc/debian_version ]]; then
+    DEBIAN_VERSION=$(cat /etc/debian_version)
+    if [[ ! "$DEBIAN_VERSION" =~ ^12\..* ]]; then
+      echo "Error: This script is designed for Proxmox VE based on Debian 12. Found Debian version: $DEBIAN_VERSION" | tee -a "$LOGFILE"
+      exit 1
+    fi
+  else
+    echo "Error: Cannot determine Debian version. /etc/debian_version not found." | tee -a "$LOGFILE"
+    exit 1
+  fi
+
+  # Check Proxmox VE version
+  PROXMOX_VERSION=$(pveversion | cut -d'/' -f2 | cut -d'-' -f1)
+  if [[ ! "$PROXMOX_VERSION" =~ ^8\..* ]]; then
+    echo "Error: This script is designed for Proxmox VE 8.x. Found Proxmox VE version: $PROXMOX_VERSION" | tee -a "$LOGFILE"
+    exit 1
+  fi
+
+  echo "[$(date)] Verified Proxmox VE version: $PROXMOX_VERSION (Debian $DEBIAN_VERSION)" >> "$LOGFILE"
+}
+
 # Add the NVIDIA repository using a static URL for Debian 12-based Proxmox VE
 add_nvidia_repo() {
   local repo_line="deb http://developer.download.nvidia.com/compute/cuda/repos/debian12/x86_64/ /"
@@ -68,7 +97,7 @@ install_nvidia_driver() {
   fi
 
   if ! check_package nvidia-open; then
-    retry_command "apt-get install -Vy nvidia-open"
+    retry_command "apt-get install -y nvidia-open"
     echo "[$(date)] Installed NVIDIA OpenGL driver" >> "$LOGFILE"
   fi
 }
@@ -107,10 +136,10 @@ ensure_kernel_compatibility() {
 
       echo "[$(date)] System updated, headers installed, and driver rebuilt" >> "$LOGFILE"
     else
-      echo "Skipping system update for kernel compatibility." >> "$LOGFILE"
+      echo "Skipping system update for kernel compatibility." | tee -a "$LOGFILE"
     fi
   else
-    echo "Skipped kernel compatibility checks due to --no-reboot flag." >> "$LOGFILE"
+    echo "Warning: Using --no-reboot may cause NVIDIA driver issues if the kernel version is not compatible. A manual reboot with kernel updates is recommended." | tee -a "$LOGFILE"
   fi
 }
 
@@ -118,6 +147,7 @@ ensure_kernel_compatibility() {
 main() {
   check_root
   setup_logging
+  check_proxmox_version
   check_nvidia_gpu
   add_nvidia_repo
   install_nvidia_driver

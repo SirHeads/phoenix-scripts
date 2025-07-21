@@ -57,6 +57,11 @@ create_user() {
   if id -u "$USERNAME" >/dev/null 2>&1; then
     echo "User $USERNAME already exists. Skipping user creation." | tee -a "$LOGFILE"
   else
+    # Prompt for password if not provided via -p
+    if [[ -z "$PASSWORD" ]]; then
+      read -s -p "Enter password for user $USERNAME (min 8 chars, 1 special char): " PASSWORD
+      echo
+    fi
     # Validate password format (at least one special character and minimum length)
     if [[ ! "$PASSWORD" =~ [[:punct:]] && ${#PASSWORD} -lt 8 ]]; then
       echo "Error: Password must be at least 8 characters long and contain at least one special character." | tee -a "$LOGFILE"
@@ -87,9 +92,11 @@ setup_sudo() {
 
   # Verify sudoers configuration for the sudo group
   SUDOERS_LINE='%sudo ALL=(ALL:ALL) ALL'
-  if ! grep -q "^$SUDOERS_LINE\$" /etc/sudoers; then
+  if ! grep -Fx "$SUDOERS_LINE" /etc/sudoers; then
     echo "$SUDOERS_LINE" >> /etc/sudoers || { echo "Error: Failed to configure sudo group in /etc/sudoers." | tee -a "$LOGFILE"; exit 1; }
     echo "[$(date)] Updated /etc/sudoers with sudo group configuration" >> "$LOGFILE"
+  else
+    echo "[$(date)] Sudoers configuration for sudo group already exists, skipping" >> "$LOGFILE"
   fi
 }
 
