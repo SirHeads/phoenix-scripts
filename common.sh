@@ -2,7 +2,7 @@
 
 # common.sh
 # Shared functions for Proxmox VE setup scripts
-# Version: 1.2.2
+# Version: 1.2.4
 # Author: Heads, Grok, Devstral
 # Usage: Source this script in other setup scripts to use common functions
 # Note: Configure log rotation for $LOGFILE using /etc/logrotate.d/proxmox_setup
@@ -28,6 +28,96 @@ check_root() {
   fi
 }
 
+# Check if a package is installed
+check_package() {
+  local package="$1"
+  dpkg-query -W -f='${Status}' "$package" 2>/dev/null | grep -q "install ok installed"
+}
+
+# Check network connectivity to a specific host
+check_network_connectivity() {
+  local host="$1"
+  local max_attempts=3
+  local attempt=0
+  local timeout=5
+
+  if [[ -z "$host" ]]; then
+    echo "Error: No host provided for connectivity check." | tee -a "$LOGFILE"
+    exit 1
+  fi
+
+  until ping -c 1 -W "$timeout" "$host" >/dev/null 2>&1; do
+    if ((attempt < max_attempts)); then
+      echo "[$(date)] Failed to reach $host, retrying ($((attempt + 1))/$max_attempts)" >> "$LOGFILE"
+      ((attempt++))
+      sleep 5
+    else
+      echo "Error: Cannot reach $host after $max_attempts attempts. Check network configuration." | tee -a "$LOGFILE"
+      exit 1
+    fi
+  done
+  echo "[$(date)] Network connectivity to $host verified" >> "$LOGFILE"
+}
+
+# Check internet connectivity
+check_internet_connectivity() {
+  local dns_server="8.8.8.8"
+  local max_attempts=3
+  local attempt=0
+  local timeout=5
+
+  until ping -c 1 -W "$timeout" "$dns_server" >/dev/null 2>&1; do
+    if ((attempt < max_attempts)); then
+      echo "[$(date)] Failed to reach $dns_server, retrying ($((attempt + 1))/$max_attempts)" >> "$LOGFILE"
+      ((attempt++))
+      sleep 5
+    else
+      echo "Warning: No internet connectivity to $dns_server after $max_attempts attempts. Some operations may fail." | tee -a "$LOGFILE"
+      return 1
+    fi
+  done
+  echo "[$(date)] Internet connectivity to $dns_server verified" >> "$LOGFILE"
+}
+
+# Check if an interface has an IP in the specified subnet
+check_interface_in_subnet() {
+  local subnet="$1"
+  local found=0
+
+  if ! [[ "$subnet" =~ ^[0-9]{1,3}\.[0-9]{1,3}\.[0-9]{1,3}\.[0-9]{1,3}/[0-9]{1,2}$ ]]; then
+    echo "Error: Invalid subnet format: $subnet" | tee -a "$LOGFILE"
+    exit 1
+  fi
+
+  # Extract IP addresses from all interfaces
+  while IFS= read -r line; do
+    if [[ "$line" =~ inet\ ([0-9]{1,3}\.[0-9]{1,3}\.[0-9]{1,3}\.[0-9]{1,3}/[0-9]{1,2}) ]]; then
+      ip_with_mask="${BASH_REMATCH[1]}"
+      # Use ipcalc or similar logic to check if IP is in subnet
+      if command -v ipcalc >/dev/null 2>&1; then
+        if ipcalc -cs "$ip_with_mask" "$subnet"; then
+          found=1
+          echo "[$(date)] Found network interface with IP $ip_with_mask in subnet $subnet" >> "$LOGFILE"
+          break
+        fi
+      else
+        # Fallback to basic subnet matching if ipcalc is not installed
+        ip=$(echo "$ip_with_mask" | cut -d'/' -f1)
+        if [[ "$ip" =~ ^$(echo "$subnet" | cut -d'/' -f1 | sed 's/\.[0-9]*$/\./') ]]; then
+          found=1
+          echo "[$(date)] Found network interface with IP $ip_with_mask in subnet $subnet (basic match)" >> "$LOGFILE"
+          break
+        fi
+      fi
+    fi
+  done < <(ip addr show | grep inet)
+
+  if [[ $found -eq 0 ]]; then
+    echo "Warning: No network interface found in subnet $subnet. NFS may not function correctly." | tee -a "$LOGFILE"
+    return 1
+  fi
+}
+
 # Create ZFS dataset with properties and mount point
 create_zfs_dataset() {
   local pool="$1"
@@ -42,7 +132,7 @@ create_zfs_dataset() {
   fi
 
   # Create the dataset with mount point and properties
-  zfs create -o mountpoint=$mountpoint "${properties[@]}" "$pool/$dataset" || {
+  zfs create -o mountpoint="$mountpoint" "${properties[@]}" "$pool/$dataset" || {
     echo "Error: Failed to create ZFS dataset $pool/$dataset with mountpoint $mountpoint" | tee -a "$LOGFILE"
     exit 1
   }

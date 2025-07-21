@@ -2,7 +2,7 @@
 
 # phoenix_config.sh
 # Configuration variables for Proxmox VE setup scripts
-# Version: 1.2.0
+# Version: 1.2.1
 # Author: Heads, Grok, Devstral
 
 # Define log file location

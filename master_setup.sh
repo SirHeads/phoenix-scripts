@@ -2,7 +2,7 @@
 
 # master_setup.sh
 # Orchestrates the execution of all Proxmox VE setup scripts
-# Version: 1.0.9
+# Version: 1.1.0
 # Author: Heads, Grok, Devstral
 
 # Source common functions and configuration variables
@@ -51,6 +51,39 @@ prompt_for_credentials() {
       exit 1
     fi
   fi
+}
+
+# Prompt for ZFS drives if not set
+prompt_for_drives() {
+  if [[ -z "$QUICKOS_DRIVES" ]]; then
+    read -p "Enter two drives for quickOS pool (e.g., nvme0n1 nvme1n1): " QUICKOS_DRIVES
+    if [[ $(echo "$QUICKOS_DRIVES" | wc -w) -ne 2 ]]; then
+      echo "Error: Exactly two drives required for quickOS pool." | tee -a "$LOGFILE"
+      exit 1
+    fi
+  fi
+  if [[ -z "$FASTDATA_DRIVE" ]]; then
+    read -p "Enter drive for fastData pool (e.g., sdb): " FASTDATA_DRIVE
+    if [[ -z "$FASTDATA_DRIVE" ]]; then
+      echo "Error: A drive is required for fastData pool." | tee -a "$LOGFILE"
+      exit 1
+    fi
+  fi
+}
+
+# Validate drives for ZFS pools
+validate_drives() {
+  for drive in $ QUICKOS_DRIVES $FASTDATA_DRIVE; do
+    if ! lsblk -d -o NAME | grep -q "^${drive}$"; then
+      echo "Error: Drive $drive does not exist." | tee -a "$LOGFILE"
+      exit 1
+    fi
+    if zpool status | grep -q "^[[:space:]]*$drive "; then
+      echo "Error: Drive $drive is already in use by another ZFS pool." | tee -a "$LOGFILE"
+      exit 1
+    fi
+  done
+  echo "[$(date)] Validated drives: $QUICKOS_DRIVES $FASTDATA_DRIVE" >> "$LOGFILE"
 }
 
 # Check for NVIDIA GPU presence
@@ -116,13 +149,11 @@ cleanup_automation() {
 # List of scripts to execute
 scripts=(
   "/usr/local/bin/phoenix_proxmox_initial_setup.sh"
-  "/usr/local/bin/common.sh"
-  "/usr/local/bin/phoenix_config.sh"
   "/usr/local/bin/phoenix_install_nvidia_driver.sh --no-reboot"
-  "/usr/local/bin/phoenix_create_admin_user.sh -u $ADMIN_USERNAME -p '$ADMIN_PASSWORD'"
+  "/usr/local/bin/phoenix_create_admin_user.sh -u $ADMIN_USERNAME -p \"$ADMIN_PASSWORD\""
   "if ! dpkg-query -W zfsutils-linux > /dev/null; then apt-get update && apt-get install -y zfsutils-linux; fi"
-  "/usr/local/bin/phoenix_setup_zfs_pools.sh -d sdb"
-  "/usr/local/bin/phoenix_setup_zfs_datasets.sh -p rpool -d $(IFS=','; echo "${ZFS_DATASET_LIST[*]}")"
+  "/usr/local/bin/phoenix_setup_zfs_pools.sh -q \"$QUICKOS_DRIVES\" -f $FASTDATA_DRIVE"
+  "/usr/local/bin/phoenix_setup_zfs_datasets.sh -q \"${QUICKOS_DATASET_LIST[*]}\" -f \"${FASTDATA_DATASET_LIST[*]}\""
   "/usr/local/bin/phoenix_setup_nfs.sh --no-reboot"
   "/usr/local/bin/phoenix_setup_samba.sh"
 )
@@ -130,6 +161,9 @@ scripts=(
 # Execute each script in order with user feedback and state tracking
 init_state_file
 prompt_for_credentials
+prompt_for_drives
+validate_drives
+export SMB_USER="$ADMIN_USERNAME"
 setup_resume_service
 for script in "${scripts[@]}"; do
   # Check if the script file exists (skip for inline commands like zfsutils-linux check)

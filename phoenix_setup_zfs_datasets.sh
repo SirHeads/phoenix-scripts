@@ -2,7 +2,7 @@
 
 # phoenix_setup_zfs_datasets.sh
 # Configures ZFS datasets on Proxmox VE
-# Version: 1.0.4
+# Version: 1.0.5
 # Author: Heads, Grok, Devstral
 # Usage: ./phoenix_setup_zfs_datasets.sh [-q "quickos_dataset_list"] [-f "fastdata_dataset_list"]
 # Note: Configure log rotation for $LOGFILE using /etc/logrotate.d/proxmox_setup

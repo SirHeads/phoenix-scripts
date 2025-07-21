@@ -2,7 +2,7 @@
 
 # phoenix_proxmox_initial_setup.sh
 # Initial setup for Proxmox VE
-# Version: 1.0.4
+# Version: 1.0.5
 # Author: Heads, Grok, Devstral
 # Usage: ./phoenix_proxmox_initial_setup.sh [--no-reboot]
 # Note: Configure log rotation for $LOGFILE using /etc/logrotate.d/proxmox_setup
@@ -130,6 +130,7 @@ iface $INTERFACE inet static
 EOF
 
     echo "[$(date)] Configured static IP for interface $INTERFACE with address $IP_ADDRESS, gateway $GATEWAY, and DNS $DNS_SERVER" >> "$LOGFILE"
+    export IP_ADDRESS
   }
 
   configure_static_ip
@@ -148,18 +149,18 @@ setup_firewall() {
   # Allow Proxmox VE services through the firewall
   retry_command "ufw allow OpenSSH"
   retry_command "ufw allow 8006/tcp"  # Proxmox VE web UI
+  retry_command "ufw allow 2049/tcp"  # NFS
+  retry_command "ufw allow 111/tcp"   # RPC for NFS
+  retry_command "ufw allow from $DEFAULT_SUBNET to any port 2049 proto tcp"
+  retry_command "ufw allow from $DEFAULT_SUBNET to any port 111 proto tcp"
 
   # Check for Samba installation before applying firewall rule
   if check_package samba; then
     retry_command "ufw allow Samba"
   fi
 
-  # Check for NFS installation before applying firewall rule
-  if check_package nfs-kernel-server; then
-    retry_command "ufw allow from $PROXMOX_NFS_SERVER to any port nfs"
-  fi
-
-  echo "[$(date)] Configured firewall rules" >> "$LOGFILE"
+  retry_command "ufw enable"
+  echo "[$(date)] Configured firewall rules for Proxmox, NFS, and Samba" >> "$LOGFILE"
 }
 
 # Main execution using common functions
@@ -168,6 +169,7 @@ main() {
   setup_logging
   update_system
   configure_network
+  update_hosts_file
   setup_firewall
 
   # Reboot system if not skipped

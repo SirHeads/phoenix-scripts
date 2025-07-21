@@ -2,7 +2,7 @@
 
 # phoenix_setup_nfs.sh
 # Installs and configures NFS server on Proxmox VE
-# Version: 1.0.4
+# Version: 1.0.5
 # Author: Heads, Grok, Devstral
 # Usage: ./phoenix_setup_nfs.sh [-o "nfs_export_options"]
 # Note: Configure log rotation for $LOGFILE using /etc/logrotate.d/proxmox_setup
@@ -69,6 +69,12 @@ check_network() {
         echo "Warning: Hostname 'localhost' does not resolve to 127.0.0.1. Check /etc/hosts." | tee -a "$LOGFILE"
     fi
 
+    # Use IP_ADDRESS from phoenix_proxmox_initial_setup.sh if set
+    if [[ -n "$IP_ADDRESS" ]]; then
+        PROXMOX_NFS_SERVER="$IP_ADDRESS"
+        export PROXMOX_NFS_SERVER
+    fi
+
     # Check network connectivity for PROXMOX_NFS_SERVER using common function
     check_network_connectivity "$PROXMOX_NFS_SERVER"
 
@@ -100,15 +106,16 @@ configure_nfs() {
     # Ensure the base mount directory exists
     mkdir -p /mnt/pve || { echo "Error: Failed to create /mnt/pve" | tee -a "$LOGFILE"; exit 1; }
 
-    local nfs_datasets=("shared-prod-data" "shared-prod-data-sync")
-    for dataset in "${nfs_datasets[@]}"; do
-        mountpoint="/mnt/pve/$dataset"
+    for dataset in "${NFS_DATASET_LIST[@]}"; do
+        mountpoint="/mnt/pve/$(basename $dataset)"
         mkdir -p "$mountpoint"
 
-        # Create ZFS datasets on quickOS pool only
-        if ! zfs list -H -o name | grep -q "^quickOS/$dataset$"; then
-            retry_command "zfs create -o mountpoint=$mountpoint quickOS/$dataset"
-            echo "[$(date)] Created ZFS dataset: quickOS/$dataset with mountpoint $mountpoint" >> "$LOGFILE"
+        # Create ZFS dataset if it doesn't exist
+        pool=$(dirname $dataset)
+        dataset_name=$(basename $dataset)
+        if ! zfs list -H -o name | grep -q "^$pool/$dataset_name$"; then
+            retry_command "zfs create -o mountpoint=$mountpoint $pool/$dataset_name"
+            echo "[$(date)] Created ZFS dataset: $pool/$dataset_name with mountpoint $mountpoint" >> "$LOGFILE"
         fi
 
         # Add NFS exports for the datasets
@@ -121,17 +128,15 @@ configure_nfs() {
         retry_command "exportfs -rav"
         echo "[$(date)] Added NFS export for $dataset" >> "$LOGFILE"
 
-        # Verify NFS exports directly in /etc/exports without complex regex
-        if ! grep -q "/mnt/pve/$dataset" /etc/exports; then
-            echo "Error: Failed to verify NFS export configuration." | tee -a "$LOGFILE"
+        # Verify NFS exports directly in /etc/exports
+        if ! grep -q "$mountpoint" /etc/exports; then
+            echo "Error: Failed to verify NFS export configuration for $mountpoint." | tee -a "$LOGFILE"
             exit 1
         fi
-    done
 
-    # Add Proxmox NFS storage using common functions
-    for dataset in "${nfs_datasets[@]}"; do
-        retry_command "pvesm add nfs --server $PROXMOX_NFS_SERVER --share /mnt/pve/$dataset --content images"
-        echo "[$(date)] Added Proxmox NFS storage: /mnt/pve/$dataset" >> "$LOGFILE"
+        # Add Proxmox NFS storage using common functions
+        retry_command "pvesm add nfs --server $PROXMOX_NFS_SERVER --share $mountpoint --content images"
+        echo "[$(date)] Added Proxmox NFS storage: $mountpoint" >> "$LOGFILE"
     done
 
     # Verify the final NFS export status
@@ -145,10 +150,11 @@ verify_nfs_exports() {
         exit 1
     fi
 
-    # Verify that the datasets are correctly exported without complex regex
-    for dataset in shared-prod-data shared-prod-data-sync; do
-        if ! exportfs -v | grep -q "/mnt/pve/$dataset "; then
-            echo "Error: NFS export verification failed for /mnt/pve/$dataset" | tee -a "$LOGFILE"
+    # Verify that the datasets are correctly exported
+    for dataset in "${NFS_DATASET_LIST[@]}"; do
+        mountpoint="/mnt/pve/$(basename $dataset)"
+        if ! exportfs -v | grep -q "$mountpoint "; then
+            echo "Error: NFS export verification failed for $mountpoint" | tee -a "$LOGFILE"
             exit 1
         fi
     done
@@ -162,6 +168,7 @@ main() {
     setup_logging
     check_pvesm
     prompt_for_subnet
+    check_network
     install_prerequisites
     configure_nfs
     verify_nfs_exports
