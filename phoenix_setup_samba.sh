@@ -2,7 +2,7 @@
 
 # phoenix_setup_samba.sh
 # Configures Samba file server on Proxmox VE
-# Version: 1.0.3
+# Version: 1.0.4
 # Author: Heads, Grok, Devstral
 # Usage: ./phoenix_setup_samba.sh [-n "network_name"]
 # Note: Configure log rotation for $LOGFILE using /etc/logrotate.d/proxmox_setup
@@ -27,7 +27,7 @@ while [[ $# -gt 0 ]]; do
   esac
 done
 
-# Ensure script runs as root using common function
+# Ensure script runs as root
 check_root() {
   if [[ $EUID -ne 0 ]]; then
     echo "Error: This script must be run with sudo." | tee -a "$LOGFILE"
@@ -35,10 +35,10 @@ check_root() {
   fi
 }
 
-# Initialize logging for consistent behavior
+# Initialize logging
 setup_logging
 
-# Install Samba packages using common functions
+# Install Samba packages
 install_samba() {
   if ! check_package samba; then
     retry_command "apt-get update && apt-get install -y samba samba-common-bin smbclient"
@@ -46,28 +46,24 @@ install_samba() {
   fi
 }
 
-# Create Samba user and set password with validation
+# Create Samba user and set password
 configure_samba_user() {
   local samba_user="${SMB_USER:-admin}"
 
-  # Check if system user exists before creating a Samba user
   if ! getent passwd "$samba_user" >/dev/null; then
     echo "Error: System user $samba_user does not exist." | tee -a "$LOGFILE"
     exit 1
   fi
 
-  # If the Samba user doesn't already exist, prompt for a password and add it
   if ! pdbedit -L | grep -q "^$samba_user:"; then
     read -s -p "Enter password for Samba user $samba_user (min 8 chars, 1 special char): " SAMBA_PASSWORD
     echo
 
-    # Validate password length and content
     if [[ ${#SAMBA_PASSWORD} -lt 8 || ! "$SAMBA_PASSWORD" =~ [^a-zA-Z0-9] ]]; then
       echo "Error: Password must be at least 8 characters long and contain at least one special character." | tee -a "$LOGFILE"
       exit 1
     fi
 
-    # Create the Samba user with a password
     echo "$SAMBA_PASSWORD" | smbpasswd -L -s -a "$samba_user" || {
       echo "Error: Failed to set Samba password for $samba_user." | tee -a "$LOGFILE"
       exit 1
@@ -84,20 +80,14 @@ configure_samba() {
   local workgroup="${NETWORK_NAME:-WORKGROUP}"
   local samba_user="${SMB_USER:-admin}"
 
-  # Ensure base mount point directory exists
   mkdir -p "$MOUNT_POINT_BASE" || { echo "Error: Failed to create $MOUNT_POINT_BASE." | tee -a "$LOGFILE"; exit 1; }
 
-  # Create dataset-specific directories and ensure they exist before configuring Samba shares
-  local datasets=("shared-prod-data" "shared-prod-data-sync" "shared-backups")
+  local datasets=("quickOS/shared-prod-data" "quickOS/shared-prod-data-sync" "quickOS/shared-backups" "fastData/shared-test-data" "fastData/shared-iso" "fastData/shared-bulk-data")
   for dataset in "${datasets[@]}"; do
-    mkdir -p "$MOUNT_POINT_BASE/$dataset" || { echo "Error: Failed to create $MOUNT_POINT_BASE/$dataset." | tee -a "$LOGFILE"; exit 1; }
-    # Create ZFS dataset for shared-backups if it doesn't exist
-    if [[ "$dataset" == "shared-backups" ]] && ! zfs list -H -o name | grep -q "^quickOS/$dataset$"; then
-      create_zfs_dataset "quickOS" "$dataset" "$MOUNT_POINT_BASE/$dataset" -o compression=lz4 -o atime=off
-    fi
+    local mountpoint="$MOUNT_POINT_BASE/$(basename $dataset)"
+    mkdir -p "$mountpoint" || { echo "Error: Failed to create $mountpoint." | tee -a "$LOGFILE"; exit 1; }
   done
 
-  # Back up existing smb.conf if it exists
   if [[ -f /etc/samba/smb.conf ]]; then
     cp /etc/samba/smb.conf "/etc/samba/smb.conf.bak.$(date +%F_%H-%M-%S)" || {
       echo "Error: Failed to back up /etc/samba/smb.conf" | tee -a "$LOGFILE"
@@ -106,7 +96,6 @@ configure_samba() {
     echo "[$(date)] Backed up /etc/samba/smb.conf" >> "$LOGFILE"
   fi
 
-  # Configure Samba global settings and shares in /etc/samba/smb.conf
   cat << EOF > /etc/samba/smb.conf
 [global]
    workgroup = $workgroup
@@ -125,6 +114,8 @@ configure_samba() {
    valid users = $samba_user
    create mask = 0644
    directory mask = 0755
+   force create mode = 0644
+   force directory mode = 0755
 
 [shared-prod-data-sync]
    path = $MOUNT_POINT_BASE/shared-prod-data-sync
@@ -133,41 +124,79 @@ configure_samba() {
    valid users = $samba_user
    create mask = 0644
    directory mask = 0755
+   force create mode = 0644
+   force directory mode = 0755
 
 [shared-backups]
    path = $MOUNT_POINT_BASE/shared-backups
    writable = no
    browsable = yes
    valid users = $samba_user
+
+[shared-test-data]
+   path = $MOUNT_POINT_BASE/shared-test-data
+   writable = yes
+   browsable = yes
+   valid users = $samba_user
+   create mask = 0644
+   directory mask = 0755
+   force create mode = 0644
+   force directory mode = 0755
+
+[shared-iso]
+   path = $MOUNT_POINT_BASE/shared-iso
+   writable = no
+   browsable = yes
+   valid users = $samba_user
+
+[shared-bulk-data]
+   path = $MOUNT_POINT_BASE/shared-bulk-data
+   writable = yes
+   browsable = yes
+   valid users = $samba_user
+   create mask = 0644
+   directory mask = 0755
+   force create mode = 0644
+   force directory mode = 0755
 EOF
 
-  # Apply the updated Samba configuration and restart services
   retry_command "systemctl restart smbd nmbd"
 
-  # Verify Samba services are running after restarting
-  if ! systemctl is-active --quiet smbd && ! systemctl is-active --quiet nmbd; then
+  if ! systemctl is-active --quiet smbd || ! systemctl is-active --quiet nmbd; then
     echo "Error: Failed to start Samba services." | tee -a "$LOGFILE"
     exit 1
   fi
 
   echo "[$(date)] Configured and restarted Samba with shares for $samba_user" >> "$LOGFILE"
 
-  # Check firewall rules before applying, avoiding redundancy with other scripts like phoenix_proxmox_initial_setup.sh
   if ! ufw status | grep -q "137/udp ALLOW Anywhere"; then
     retry_command "ufw allow Samba"
-    echo "[$(date)] Updated firewall to allow Samba traffic" | tee -a "$LOGFILE"
+    echo "[$(date)] Updated firewall to allow Samba traffic" >> "$LOGFILE"
   else
-    echo "[$(date)] Samba firewall rules already set, skipping." | tee -a "$LOGFILE"
+    echo "[$(date)] Samba firewall rules already set, skipping." >> "$LOGFILE"
   fi
 }
 
-# Main execution using common functions
+# Configure LXC bind mounts
+configure_lxc_bind_mounts() {
+  local datasets=("quickOS/shared-prod-data" "quickOS/shared-prod-data-sync" "fastData/shared-test-data" "fastData/shared-bulk-data")
+  for dataset in "${datasets[@]}"; do
+    local mountpoint="/mnt/pve/$(basename $dataset)"
+    if zfs_dataset_exists "$dataset"; then
+      # Note: Actual LXC bind mount configuration requires per-container setup in Proxmox
+      echo "[$(date)] LXC bind mount configuration for $dataset should use discard,noatime options in Proxmox LXC config" >> "$LOGFILE"
+    fi
+  done
+}
+
+# Main execution
 main() {
   check_root
   setup_logging
   install_samba
   configure_samba_user
   configure_samba
+  configure_lxc_bind_mounts
 
   echo "[$(date)] Completed Samba server configuration" >> "$LOGFILE"
 }

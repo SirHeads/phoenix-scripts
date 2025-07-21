@@ -2,7 +2,7 @@
 
 # phoenix_setup_zfs_datasets.sh
 # Configures ZFS datasets on Proxmox VE
-# Version: 1.0.5
+# Version: 1.0.6
 # Author: Heads, Grok, Devstral
 # Usage: ./phoenix_setup_zfs_datasets.sh [-q "quickos_dataset_list"] [-f "fastdata_dataset_list"]
 # Note: Configure log rotation for $LOGFILE using /etc/logrotate.d/proxmox_setup
@@ -32,7 +32,7 @@ while getopts ":q:f:" opt; do
   esac
 done
 
-# Ensure script runs as root using common function
+# Ensure script runs as root
 check_root() {
   if [[ $EUID -ne 0 ]]; then
     echo "Error: This script must be run with sudo." | tee -a "$LOGFILE"
@@ -49,25 +49,55 @@ check_pvesm() {
   echo "[$(date)] Verified pvesm availability" >> "$LOGFILE"
 }
 
-# Initialize logging for consistent behavior
+# Initialize logging
 setup_logging
 
-# Create datasets for quickOS pool using common functions
+# Create sub-datasets for VMs and LXC containers
+create_sub_datasets() {
+  local pool="$1"
+  local parent_dataset="$2"
+  local count="$3"
+  local prefix="$4"
+
+  for i in $(seq 1 "$count"); do
+    local sub_dataset="${parent_dataset}/${prefix}${i}"
+    if ! zfs_dataset_exists "$pool/$sub_dataset"; then
+      create_zfs_dataset "$pool" "$sub_dataset" "none" -o compression=lz4 -o atime=off
+      echo "[$(date)] Created sub-dataset: $pool/$sub_dataset" >> "$LOGFILE"
+    else
+      echo "[$(date)] Sub-dataset $pool/$sub_dataset already exists, skipping" >> "$LOGFILE"
+    fi
+  done
+}
+
+# Create datasets for quickOS pool
 create_quickos_datasets() {
   local pool="$QUICKOS_POOL"
   local datasets=("${QUICKOS_DATASET_LIST[@]}")
 
-  # Create datasets only if the pool exists
   if zfs_pool_exists "$pool"; then
     for dataset in "${datasets[@]}"; do
       local mountpoint="$MOUNT_POINT_BASE/$dataset"
+      local properties
+      IFS=',' read -r -a properties <<< "${QUICKOS_DATASET_PROPERTIES[$dataset]}"
+      local zfs_properties=()
+      for prop in "${properties[@]}"; do
+        zfs_properties+=("-o $prop")
+      done
 
-      # Create ZFS dataset if it doesn't exist
-      if ! zfs list -H -o name | grep -q "^$pool/$dataset$"; then
-        create_zfs_dataset "$pool" "$dataset" "$mountpoint" -o compression=lz4 -o atime=off
+      if ! zfs_dataset_exists "$pool/$dataset"; then
+        create_zfs_dataset "$pool" "$dataset" "$mountpoint" "${zfs_properties[@]}"
         echo "[$(date)] Created ZFS dataset: $pool/$dataset with mountpoint $mountpoint" >> "$LOGFILE"
       else
-        echo "[$(date)] ZFS dataset $pool/$dataset already exists, skipping creation" >> "$LOGFILE"
+        set_zfs_properties "$pool/$dataset" "${zfs_properties[@]/-o /}"
+        echo "[$(date)] Updated properties for ZFS dataset: $pool/$dataset" >> "$LOGFILE"
+      fi
+
+      # Create sub-datasets for vm-disks and lxc-disks
+      if [[ "$dataset" == "vm-disks" ]]; then
+        create_sub_datasets "$pool" "$dataset" 10 "vm"  # Create 10 VM sub-datasets
+      elif [[ "$dataset" == "lxc-disks" ]]; then
+        create_sub_datasets "$pool" "$dataset" 10 "lxc"  # Create 10 LXC sub-datasets
       fi
     done
   else
@@ -76,22 +106,27 @@ create_quickos_datasets() {
   fi
 }
 
-# Create datasets for fastData pool using common functions
+# Create datasets for fastData pool
 create_fastdata_datasets() {
   local pool="$FASTDATA_POOL"
   local datasets=("${FASTDATA_DATASET_LIST[@]}")
 
-  # Create datasets only if the pool exists
   if zfs_pool_exists "$pool"; then
     for dataset in "${datasets[@]}"; do
       local mountpoint="$MOUNT_POINT_BASE/$dataset"
+      local properties
+      IFS=',' read -r -a properties <<< "${FASTDATA_DATASET_PROPERTIES[$dataset]}"
+      local zfs_properties=()
+      for prop in "${properties[@]}"; do
+        zfs_properties+=("-o $prop")
+      done
 
-      # Create ZFS dataset if it doesn't exist
-      if ! zfs list -H -o name | grep -q "^$pool/$dataset$"; then
-        create_zfs_dataset "$pool" "$dataset" "$mountpoint" -o compression=lz4 -o atime=off
+      if ! zfs_dataset_exists "$pool/$dataset"; then
+        create_zfs_dataset "$pool" "$dataset" "$mountpoint" "${zfs_properties[@]}"
         echo "[$(date)] Created ZFS dataset: $pool/$dataset with mountpoint $mountpoint" >> "$LOGFILE"
       else
-        echo "[$(date)] ZFS dataset $pool/$dataset already exists, skipping creation" >> "$LOGFILE"
+        set_zfs_properties "$pool/$dataset" "${zfs_properties[@]/-o /}"
+        echo "[$(date)] Updated properties for ZFS dataset: $pool/$dataset" >> "$LOGFILE"
       fi
     done
   else
@@ -100,48 +135,78 @@ create_fastdata_datasets() {
   fi
 }
 
-# Add datasets as Proxmox storage using common functions
+# Add datasets as Proxmox storage
 add_proxmox_storage() {
-  local pool="$1"
-  shift
-  local datasets=("$@")
-
-  # Check pvesm availability
   check_pvesm
 
-  for dataset in "${datasets[@]}"; do
-    local storage_id=$(echo "$dataset" | tr '/' '-')
+  # Add quickOS/vm-disks and quickOS/lxc-disks as ZFS storage
+  for dataset in "vm-disks" "lxc-disks"; do
+    local storage_id="zfs-$(echo "$dataset" | tr '/' '-')"
     if ! pvesm status | grep -q "^$storage_id"; then
-      retry_command "pvesm add zfspool $storage_id -pool $pool/$dataset -content images"
-      echo "[$(date)] Added Proxmox storage: $storage_id for $pool/$dataset" >> "$LOGFILE"
+      retry_command "pvesm add zfspool $storage_id -pool $QUICKOS_POOL/$dataset -content images"
+      echo "[$(date)] Added Proxmox ZFS storage: $storage_id for $QUICKOS_POOL/$dataset" >> "$LOGFILE"
+    else
+      echo "[$(date)] Proxmox storage $storage_id already exists, skipping" >> "$LOGFILE"
+    fi
+  done
+
+  # Add quickOS/shared-prod-data and shared-prod-data-sync as NFS storage
+  for dataset in "shared-prod-data" "shared-prod-data-sync"; do
+    local storage_id="nfs-$(echo "$dataset" | tr '/' '-')"
+    local mountpoint="$MOUNT_POINT_BASE/$dataset"
+    if ! pvesm status | grep -q "^$storage_id"; then
+      retry_command "pvesm add nfs $storage_id -server $PROXMOX_NFS_SERVER -path $mountpoint -content images"
+      echo "[$(date)] Added Proxmox NFS storage: $storage_id for $QUICKOS_POOL/$dataset" >> "$LOGFILE"
+    else
+      echo "[$(date)] Proxmox storage $storage_id already exists, skipping" >> "$LOGFILE"
+    fi
+  done
+
+  # Add fastData datasets as NFS storage
+  for dataset in "${FASTDATA_DATASET_LIST[@]}"; do
+    local storage_id="nfs-$(echo "$dataset" | tr '/' '-')"
+    local mountpoint="$MOUNT_POINT_BASE/$dataset"
+    local content="images"
+    if [[ "$dataset" == "shared-backups" ]]; then
+      content="backup"
+    elif [[ "$dataset" == "shared-iso" ]]; then
+      content="iso"
+    fi
+    if ! pvesm status | grep -q "^$storage_id"; then
+      retry_command "pvesm add nfs $storage_id -server $PROXMOX_NFS_SERVER -path $mountpoint -content $content"
+      echo "[$(date)] Added Proxmox NFS storage: $storage_id for $FASTDATA_POOL/$dataset" >> "$LOGFILE"
     else
       echo "[$(date)] Proxmox storage $storage_id already exists, skipping" >> "$LOGFILE"
     fi
   done
 }
 
-# Main execution using common functions
+# Configure snapshot policy
+configure_snapshots() {
+  local datasets=("${QUICKOS_DATASET_LIST[@]}" "${FASTDATA_DATASET_LIST[@]}")
+  for dataset in "${datasets[@]}"; do
+    local pool="$QUICKOS_POOL"
+    if [[ "${FASTDATA_DATASET_LIST[*]}" =~ "$dataset" ]]; then
+      pool="$FASTDATA_POOL"
+    fi
+    if zfs_dataset_exists "$pool/$dataset"; then
+      zfs set com.sun:auto-snapshot=true "$pool/$dataset" || {
+        echo "Warning: Failed to enable auto-snapshot on $pool/$dataset" >> "$LOGFILE"
+      }
+      echo "[$(date)] Enabled auto-snapshot on $pool/$dataset" >> "$LOGFILE"
+    fi
+  done
+}
+
+# Main execution
 main() {
   check_root
   setup_logging
 
-  # Use environment variables or command-line arguments if set, otherwise fall back to config
-  if [[ -z "${QUICKOS_DATASET_LIST+x}" && -z "${OPTARG+x}" ]]; then
-    echo "[$(date)] Using QUICKOS_DATASET_LIST from phoenix_config.sh" >> "$LOGFILE"
-  else
-    echo "[$(date)] Using provided QUICKOS_DATASET_LIST: ${QUICKOS_DATASET_LIST[*]}" >> "$LOGFILE"
-  fi
-
-  if [[ -z "${FASTDATA_DATASET_LIST+x}" && -z "${OPTARG+x}" ]]; then
-    echo "[$(date)] Using FASTDATA_DATASET_LIST from phoenix_config.sh" >> "$LOGFILE"
-  else
-    echo "[$(date)] Using provided FASTDATA_DATASET_LIST: ${FASTDATA_DATASET_LIST[*]}" >> "$LOGFILE"
-  fi
-
   create_quickos_datasets
   create_fastdata_datasets
-  add_proxmox_storage "$QUICKOS_POOL" "${QUICKOS_DATASET_LIST[@]}"
-  add_proxmox_storage "$FASTDATA_POOL" "${FASTDATA_DATASET_LIST[@]}"
+  add_proxmox_storage
+  configure_snapshots
 
   echo "[$(date)] Completed ZFS dataset setup" >> "$LOGFILE"
 }

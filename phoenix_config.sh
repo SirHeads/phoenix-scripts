@@ -2,7 +2,7 @@
 
 # phoenix_config.sh
 # Configuration variables for Proxmox VE setup scripts
-# Version: 1.2.1
+# Version: 1.2.2
 # Author: Heads, Grok, Devstral
 
 # Define log file location
@@ -43,13 +43,38 @@ load_config() {
   FASTDATA_DRIVE=${FASTDATA_DRIVE:-""}  # Single NVMe drive, e.g., "nvme2n1"
   export QUICKOS_DRIVES FASTDATA_DRIVE
 
-  # Define ZFS dataset lists
+  # Define ZFS dataset lists with properties
+  declare -A QUICKOS_DATASET_PROPERTIES
+  QUICKOS_DATASET_PROPERTIES=(
+    ["vm-disks"]="recordsize=128K,compression=lz4,sync=standard,quota=800G"
+    ["lxc-disks"]="recordsize=16K,compression=lz4,sync=standard,quota=600G"
+    ["shared-prod-data"]="recordsize=128K,compression=lz4,sync=standard,quota=400G"
+    ["shared-prod-data-sync"]="recordsize=16K,compression=lz4,sync=always,quota=100G"
+    ["shared-backups"]="recordsize=1M,compression=zstd,sync=standard,quota=2T"
+  )
   QUICKOS_DATASET_LIST=("vm-disks" "lxc-disks" "shared-prod-data" "shared-prod-data-sync" "shared-backups")
-  FASTDATA_DATASET_LIST=("shared-test-data" "shared-iso" "shared-bulk-data")
-  export QUICKOS_DATASET_LIST FASTDATA_DATASET_LIST
+  export QUICKOS_DATASET_LIST
 
-  # Define NFS dataset lists
-  NFS_DATASET_LIST=("quickOS/shared-prod-data" "quickOS/shared-prod-data-sync" "fastData/shared-test-data" "fastData/shared-bulk-data")
+  declare -A FASTDATA_DATASET_PROPERTIES
+  FASTDATA_DATASET_PROPERTIES=(
+    ["shared-test-data"]="recordsize=128K,compression=lz4,sync=standard,quota=500G"
+    ["shared-backups"]="recordsize=1M,compression=zstd,sync=standard,quota=2T"
+    ["shared-iso"]="recordsize=1M,compression=lz4,sync=standard,quota=100G"
+    ["shared-bulk-data"]="recordsize=1M,compression=lz4,sync=standard,quota=1.4T"
+  )
+  FASTDATA_DATASET_LIST=("shared-test-data" "shared-backups" "shared-iso" "shared-bulk-data")
+  export FASTDATA_DATASET_LIST
+
+  # Define NFS dataset lists with specific export options
+  declare -A NFS_DATASET_OPTIONS
+  NFS_DATASET_OPTIONS=(
+    ["quickOS/shared-prod-data"]="rw,async,no_subtree_check,noatime"
+    ["quickOS/shared-prod-data-sync"]="rw,sync,no_subtree_check,noatime"
+    ["fastData/shared-test-data"]="rw,async,no_subtree_check,noatime"
+    ["fastData/shared-iso"]="rw,async,no_subtree_check,noatime"
+    ["fastData/shared-bulk-data"]="rw,async,no_subtree_check,noatime"
+  )
+  NFS_DATASET_LIST=("quickOS/shared-prod-data" "quickOS/shared-prod-data-sync" "fastData/shared-test-data" "fastData/shared-iso" "fastData/shared-bulk-data")
   export NFS_DATASET_LIST
 
   # Define base mount point for datasets
@@ -57,7 +82,7 @@ load_config() {
   export MOUNT_POINT_BASE
 
   # Define ARC limit (30GB in bytes)
-  ZFS_ARC_MAX="32212254720"
+  ZFS_ARC_MAX="32212254720"  # 30GB
   export ZFS_ARC_MAX
 
   echo "[$(date)] Configuration variables loaded" >> "$LOGFILE"

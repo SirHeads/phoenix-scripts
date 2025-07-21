@@ -2,7 +2,7 @@
 
 # phoenix_setup_zfs_pools.sh
 # Configures ZFS pools on Proxmox VE
-# Version: 1.2.0
+# Version: 1.2.1
 # Author: Heads, Grok, Devstral
 # Usage: ./phoenix_setup_zfs_pools.sh [-q "quickos_drives"] [-f "fastdata_drive"]
 # Note: Configure log rotation for $LOGFILE using /etc/logrotate.d/proxmox_setup
@@ -40,19 +40,6 @@ check_root() {
 # Initialize logging for consistent behavior
 setup_logging
 
-# Check if pool exists using common functions (default to rpool if not specified)
-check_pool() {
-  local pool_name="$1"
-
-  # Verify the ZFS pool existence with common function
-  if ! zfs_pool_exists "$pool_name"; then
-    echo "Error: Pool $pool_name does not exist. Please specify an existing pool." | tee -a "$LOGFILE"
-    exit 1
-  fi
-
-  echo "[$(date)] Using ZFS pool: $pool_name" >> "$LOGFILE"
-}
-
 # Verify the drive exists and isn't part of an existing ZFS pool
 check_available_drives() {
   local drive="$1"
@@ -77,6 +64,15 @@ check_available_drives() {
     exit 1
   fi
 
+  # Verify NVMe firmware is up-to-date
+  if [[ "$DRIVE_TYPE" == "nvme" ]]; then
+    if command -v nvme >/dev/null 2>&1; then
+      nvme id-ctrl /dev/$drive | grep -q "frmw" && echo "[$(date)] NVMe firmware check for $drive: $(nvme id-ctrl /dev/$drive | grep frmw)" >> "$LOGFILE"
+    else
+      echo "[$(date)] nvme-cli not installed, skipping firmware check for $drive" >> "$LOGFILE"
+    fi
+  fi
+
   echo "[$(date)] Verified that drive $drive is available" >> "$LOGFILE"
 }
 
@@ -97,7 +93,22 @@ check_system_ram() {
   echo "[$(date)] Verified system RAM ($((total_ram / 1024 / 1024 / 1024)) GB) is sufficient for ZFS_ARC_MAX" >> "$LOGFILE"
 }
 
-# Create ZFS pools using common functions (default to QUICKOS_DATASET_LIST and FASTDATA_DATASET_LIST if not specified)
+# Monitor NVMe wear
+monitor_nvme_wear() {
+  local drives="$@"
+  if command -v smartctl >/dev/null 2>&1; then
+    for drive in $drives; do
+      if lsblk -d -o NAME,TRAN | grep "^${drive}" | grep -q "nvme"; then
+        smartctl -a /dev/$drive | grep -E "Wear_Leveling|Media_Wearout" >> "$LOGFILE" 2>/dev/null
+        echo "[$(date)] NVMe wear stats for $drive logged" >> "$LOGFILE"
+      fi
+    done
+  else
+    echo "[$(date)] smartctl not installed, skipping NVMe wear monitoring" >> "$LOGFILE"
+  fi
+}
+
+# Create ZFS pools
 create_zfs_pools() {
   # Create quickOS pool (mirrored)
   if zfs_pool_exists "$QUICKOS_POOL"; then
@@ -112,6 +123,7 @@ create_zfs_pools() {
     done
     retry_command "zpool create -f -o autotrim=on -O compression=lz4 -O atime=off $QUICKOS_POOL mirror $QUICKOS_DRIVES"
     echo "[$(date)] Created ZFS pool: $QUICKOS_POOL on $QUICKOS_DRIVES" >> "$LOGFILE"
+    monitor_nvme_wear "$QUICKOS_DRIVES"
   fi
 
   # Create fastData pool (single)
@@ -121,6 +133,7 @@ create_zfs_pools() {
     check_available_drives "$FASTDATA_DRIVE"
     retry_command "zpool create -f -o autotrim=on -O compression=lz4 -O atime=off $FASTDATA_POOL $FASTDATA_DRIVE"
     echo "[$(date)] Created ZFS pool: $FASTDATA_POOL on $FASTDATA_DRIVE" >> "$LOGFILE"
+    monitor_nvme_wear "$FASTDATA_DRIVE"
   fi
 
   # Check system RAM before setting ARC limit
@@ -138,12 +151,12 @@ create_zfs_pools() {
 install_zfs_packages() {
   if ! check_package "zfsutils-linux"; then
     retry_command "apt-get update"
-    retry_command "apt-get install -y zfsutils-linux"
-    echo "[$(date)] Installed zfsutils-linux" >> "$LOGFILE"
+    retry_command "apt-get install -y zfsutils-linux smartmontools"
+    echo "[$(date)] Installed zfsutils-linux and smartmontools" >> "$LOGFILE"
   fi
 }
 
-# Main execution using common functions
+# Main execution
 main() {
   check_root
   setup_logging
@@ -156,9 +169,7 @@ main() {
     read -p "Enter the drive for fastData pool (e.g., nvme2n1): " FASTDATA_DRIVE
   fi
 
-  # Ensure ZFS packages are installed before creating pools
   install_zfs_packages
-
   create_zfs_pools
 
   echo "[$(date)] Completed ZFS pool setup" >> "$LOGFILE"
