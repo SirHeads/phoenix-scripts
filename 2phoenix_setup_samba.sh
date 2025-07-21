@@ -9,6 +9,7 @@
 
 # Source common functions and configuration variables
 source /usr/local/bin/common.sh || { echo "Error: Failed to source common.sh"; exit 1; }
+source /usr/local/bin/phoenix_config.sh || { echo "Error: Failed to source phoenix_config.sh"; exit 1; }
 load_config
 
 # Parse command-line arguments

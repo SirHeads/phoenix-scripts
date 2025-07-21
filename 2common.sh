@@ -2,7 +2,7 @@
 
 # common.sh
 # Shared functions for Proxmox VE setup scripts
-# Version: 1.2.0
+# Version: 1.1.1
 # Author: Heads, Grok, Devstral
 # Usage: Source this script in other setup scripts to use common functions
 # Note: Configure log rotation for $LOGFILE using /etc/logrotate.d/proxmox_setup
@@ -61,73 +61,3 @@ check_package() {
 
 # Initialize logging
 setup_logging
-
-# Check if ZFS pool exists
-zfs_pool_exists() {
-  local pool="$1"
-  if zpool list -H -o name | grep -q "^$pool$"; then
-    return 0
-  fi
-  return 1
-}
-
-# Create ZFS dataset
-create_zfs_dataset() {
-  local pool="$1"
-  local dataset="$2"
-  local mountpoint="$3"
-
-  if zfs list -H -o name | grep -q "^$pool/$dataset$"; then
-    echo "Dataset $pool/$dataset already exists, skipping creation" | tee -a "$LOGFILE"
-    return 0
-  fi
-
-  zfs create -o mountpoint=$mountpoint $pool/$dataset || {
-    echo "Error: Failed to create $pool/$dataset dataset" | tee -a "$LOGFILE"
-    exit 1
-  }
-}
-
-# Set firewall rule using UFW
-set_firewall_rule() {
-  local rule="$1"
-  if ! ufw $rule; then
-    echo "Failed to set firewall rule: $rule" | tee -a "$LOGFILE"
-    exit 1
-  fi
-}
-
-# Check if a port is listening
-port_is_listening() {
-  local port="$1"
-  local proto="$2"
-
-  if [[ "$proto" = "udp" ]]; then
-    ss -uln | grep -q ":$port "
-  else
-    ss -tln | grep -q ":$port "
-  fi
-
-  return $?
-}
-
-# Add user to a group
-add_user_to_group() {
-  local username="$1"
-  local group="$2"
-
-  if ! id -nG "$username" | grep -qw "$group"; then
-    usermod -aG "$group" "$username" || {
-      echo "Error: Failed to add user $username to group $group" | tee -a "$LOGFILE"
-      exit 1
-    }
-  fi
-}
-
-# Verify NFS exports
-verify_nfs_exports() {
-  if ! exportfs -v; then
-    echo "Error: Failed to verify NFS exports" | tee -a "$LOGFILE"
-    exit 1
-  fi
-}

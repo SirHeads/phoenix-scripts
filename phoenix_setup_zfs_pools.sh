@@ -1,218 +1,155 @@
 #!/bin/bash
 
-# phoenix_setup_zfs_pools.sh
-# Configures ZFS pools (quickOS, fastData) for NVMe drives and tunes ARC cache.
+# proxmox_setup_zfs_pools.sh
+# Configures ZFS pools on Proxmox VE
 # Version: 1.0.2
 # Author: Heads, Grok, Devstral
-# Usage: ./phoenix_setup_zfs_pools.sh
+# Usage: ./proxmox_setup_zfs_pools.sh [-d "data_drive"] [-l "log_drive"]
 # Note: Configure log rotation for $LOGFILE using /etc/logrotate.d/proxmox_setup
-# Run before phoenix_setup_zfs_datasets.sh
 
-# Exit on any error
-set -e
-
-# Source common functions
+# Source common functions and configuration variables
 source /usr/local/bin/common.sh || { echo "Error: Failed to source common.sh"; exit 1; }
+source /usr/local/bin/phoenix_config.sh || { echo "Error: Failed to source phoenix_config.sh"; exit 1; }
+load_config
 
-# Constants
-ARC_MAX=$((24 * 1024 * 1024 * 1024)) # 24GB ARC cache for 96GB RAM system
+# Parse command-line arguments
+while [[ $# -gt 0 ]]; do
+  case $1 in
+    -d)
+      DATA_DRIVE="$2"
+      shift 2
+      ;;
+    -l)
+      LOG_DRIVE="$2"
+      shift 2
+      ;;
+    *)
+      echo "Error: Unknown option $1" | tee -a "$LOGFILE"
+      exit 1
+      ;;
+  esac
+done
 
-# Ensure script runs as root
+# Ensure script runs as root using common function
 check_root() {
-    if [[ $EUID -ne 0 ]]; then
-        echo "Error: This script must be run as root." | tee -a "$LOGFILE"
-        exit 1
+  if [[ $EUID -ne 0 ]]; then
+    echo "Error: This script must be run with sudo." | tee -a "$LOGFILE"
+    exit 1
+  fi
+}
+
+# Install ZFS packages using common functions
+install_zfs_packages() {
+  if ! check_package zfsutils-linux; then
+    retry_command "apt-get update && apt-get install -y zfsutils-linux"
+    echo "[$(date)] Installed ZFS utilities" >> "$LOGFILE"
+  fi
+}
+
+# Check for available drives and prompt user if needed using common functions
+check_available_drives() {
+  echo "Checking available disks..." | tee -a "$LOGFILE"
+
+  # List unpartitioned or unused disks
+  lsblk_output=$(lsblk -no NAME,TYPE,SIZE,MODEL -e 7,11)
+  echo "$lsblk_output" >> "$LOGFILE"
+  while read -r line; do
+    if [[ $line == *"disk"* && ! $line =~ "vda\|vdb\|vd*" ]]; then
+      disk_name=$(echo $line | awk '{print $1}')
+      echo "Found available disk: /dev/$disk_name" | tee -a "$LOGFILE"
+      if [[ -z "$DATA_DRIVE" ]]; then
+        read -p "Use this as data drive (y/n)? " response
+        case $response in
+          [Yy]* )
+            DATA_DRIVE="/dev/$disk_name"
+            ;;
+          * )
+            echo "Skipping disk /dev/$disk_name" | tee -a "$LOGFILE"
+            ;;
+        esac
+      fi
+
+      if [[ -z "$LOG_DRIVE" ]]; then
+        read -p "Use this as log drive (y/n)? " response
+        case $response in
+          [Yy]* )
+            LOG_DRIVE="/dev/$disk_name"
+            ;;
+          * )
+            echo "Skipping disk /dev/$disk_name" | tee -a "$LOGFILE"
+            ;;
+        esac
+      fi
+
+      # If both drives are selected, break out of loop using common functions
+      if [[ ! -z "$DATA_DRIVE" && ! -z "$LOG_DRIVE" ]]; then
+        break
+      fi
     fi
+  done <<< "$lsblk_output"
+
+  # Ensure drives were selected using common functions
+  if [[ -z "$DATA_DRIVE" || -z "$LOG_DRIVE" ]]; then
+    echo "Error: Both data and log drives must be specified." | tee -a "$LOGFILE"
+    exit 1
+  fi
 }
 
-# Initialize logging
-setup_logging() {
-    exec 1> >(tee -a "$LOGFILE")
-    exec 2>&1
-    echo "Starting ZFS pool setup at $(date)" | tee -a "$LOGFILE"
-}
-
-# Check ZFS version for autotrim support
-check_zfs_version() {
-    echo "Checking ZFS version..." | tee -a "$LOGFILE"
-    ZFS_VERSION=$(zfs version | head -n1 | cut -d'-' -f2)
-    if [[ "$ZFS_VERSION" < "2.0" ]]; then
-        echo "Warning: ZFS version $ZFS_VERSION does not support autotrim. Will rely on periodic fstrim." | tee -a "$LOGFILE"
-        AUTOTRIM_SUPPORTED=false
-    else
-        echo "ZFS version $ZFS_VERSION supports autotrim." | tee -a "$LOGFILE"
-        AUTOTRIM_SUPPORTED=true
-    fi
-}
-
-# Prompt for NVMe drives
-prompt_for_drives() {
-    echo "Available NVMe drives:" | tee -a "$LOGFILE"
-    lsblk -d -o NAME,SIZE,MODEL | grep nvme
-    echo "Select two NVMe drives for quickOS (mirrored, 2TB each, e.g., /dev/nvme0n1 /dev/nvme2n1):"
-    read -r -p "Enter two drive paths (space-separated): " quickos_drive1 quickos_drive2
-    if [[ ! -b "$quickos_drive1" || ! -b "$quickos_drive2" ]]; then
-        echo "Error: Invalid or non-existent drives: $quickos_drive1, $quickos_drive2" | tee -a "$LOGFILE"
-        exit 1
-    fi
-    QUICKOS_2TB_DRIVES=("$quickos_drive1" "$quickos_drive2")
-
-    echo "Select one NVMe drive for fastData (2TB, e.g., /dev/nvme1n1):"
-    read -r -p "Enter drive path: " fastdata_drive
-    if [[ ! -b "$fastdata_drive" ]]; then
-        echo "Error: Invalid or non-existent drive: $fastdata_drive" | tee -a "$LOGFILE"
-        exit 1
-    fi
-    FASTDATA_2TB_DRIVE="$fastdata_drive"
-}
-
-# Check if drives are in use
-check_drives_free() {
-    echo "Checking if drives are free..." | tee -a "$LOGFILE"
-    for drive in "${QUICKOS_2TB_DRIVES[@]}" "$FASTDATA_2TB_DRIVE"; do
-        if zpool status | grep -q "$drive"; then
-            echo "Error: Drive $drive is part of an existing ZFS pool. Destroy the pool first." | tee -a "$LOGFILE"
-            exit 1
-        fi
-        if mount | grep -q "$drive"; then
-            echo "Error: Drive $drive is mounted. Unmount it first." | tee -a "$LOGFILE"
-            exit 1
-        fi
-        if pvdisplay | grep -q "$drive"; then
-            echo "Error: Drive $drive is part of an LVM physical volume. Remove it first." | tee -a "$LOGFILE"
-            exit 1
-        fi
-        if lsof "$drive" > /dev/null 2>&1; then
-            echo "Error: Drive $drive is in use by a process. Stop processes first." | tee -a "$LOGFILE"
-            exit 1
-        fi
-    done
-}
-
-# Confirm drive wiping
-confirm_wipe_drives() {
-    echo "WARNING: This script will wipe the following drives:" | tee -a "$LOGFILE"
-    echo "quickOS (mirror): ${QUICKOS_2TB_DRIVES[*]}" | tee -a "$LOGFILE"
-    echo "fastData (single): $FASTDATA_2TB_DRIVE" | tee -a "$LOGFILE"
-    read -p "Proceed with wiping drives? (y/N): " confirm
-    if [[ ! "$confirm" =~ ^[Yy]$ ]]; then
-        echo "Aborted by user." | tee -a "$LOGFILE"
-        exit 1
-    fi
-}
-
-# Wipe drives
-wipe_drives() {
-    echo "Wiping drives..." | tee -a "$LOGFILE"
-    for drive in "${QUICKOS_2TB_DRIVES[@]}" "$FASTDATA_2TB_DRIVE"; do
-        if [[ -b "$drive" ]]; then
-            wipefs -a "$drive" || { echo "Failed to wipe $drive" | tee -a "$LOGFILE"; exit 1; }
-        else
-            echo "Error: Drive $drive not found." | tee -a "$LOGFILE"
-            exit 1
-        fi
-    done
-}
-
-# Create ZFS pools
+# Create ZFS pools using common functions
 create_zfs_pools() {
-    echo "Checking for existing ZFS pools..." | tee -a "$LOGFILE"
-    
-    # Convert raw device paths to /dev/disk/by-id/ paths
-    local quickos_id1 quickos_id2 fastdata_id
-    quickos_id1=$(ls -l /dev/disk/by-id/ | grep $(basename "$quickos_drive1") | awk '{print $9}' | head -1)
-    quickos_id2=$(ls -l /dev/disk/by-id/ | grep $(basename "$quickos_drive2") | awk '{print $9}' | head -1)
-    fastdata_id=$(ls -l /dev/disk/by-id/ | grep $(basename "$fastdata_drive") | awk '{print $9}' | head -1)
-    
-    if [[ -z "$quickos_id1" || -z "$quickos_id2" || -z "$fastdata_id" ]]; then
-        echo "Error: Could not find /dev/disk/by-id/ paths for one or more drives" | tee -a "$LOGFILE"
-        exit 1
-    fi
-    
-    # Create or import quickOS pool
-    if zpool status quickOS >/dev/null 2>&1; then
-        echo "Warning: quickOS pool already exists, skipping creation" | tee -a "$LOGFILE"
-        zpool import -d /dev/disk/by-id -f quickOS || {
-            echo "Error: Failed to import existing quickOS pool" | tee -a "$LOGFILE"
-            exit 1
-        }
-    else
-        echo "Creating ZFS pool quickOS (mirror)..." | tee -a "$LOGFILE"
-        if [[ "$AUTOTRIM_SUPPORTED" == "true" ]]; then
-            zpool create -f -o ashift=12 -o autotrim=on quickOS mirror /dev/disk/by-id/"$quickos_id1" /dev/disk/by-id/"$quickos_id2" || {
-                echo "Failed to create quickOS pool" | tee -a "$LOGFILE"
-                exit 1
-            }
-        else
-            zpool create -f -o ashift=12 quickOS mirror /dev/disk/by-id/"$quickos_id1" /dev/disk/by-id/"$quickos_id2" || {
-                echo "Failed to create quickOS pool" | tee -a "$LOGFILE"
-                exit 1
-            }
-            echo "Setting up periodic fstrim due to lack of autotrim support..." | tee -a "$LOGFILE"
-            echo "15 3 * * * root fstrim /quickOS" > /etc/cron.d/fstrim_quickOS
-        fi
-        zfs set compression=lz4 atime=off quickOS || {
-            echo "Failed to set properties on quickOS pool" | tee -a "$LOGFILE"
-            exit 1
-        }
-        zpool export quickOS && zpool import -d /dev/disk/by-id quickOS || {
-            echo "Failed to export/import quickOS to update cache" | tee -a "$LOGFILE"
-            exit 1
-        }
+  local pool_name="rpool"
+
+  # Check if the pool already exists using common function
+  if zfs_pool_exists "$pool_name"; then
+    echo "Pool $pool_name already exists, skipping creation." | tee -a "$LOGFILE"
+  else
+    retry_command "zpool create -f $pool_name $DATA_DRIVE"
+    echo "[$(date)] Created ZFS pool: $pool_name on $DATA_DRIVE" >> "$LOGFILE"
+
+    # Create log device if specified and not already attached to a pool using common function
+    if [[ ! -z "$LOG_DRIVE" && ! zfs_pool_exists | grep -qv "^$pool_name\s" ]]; then
+      retry_command "zpool add $pool_name log $LOG_DRIVE"
+      echo "[$(date)] Added log device: $LOG_DRIVE to pool: $pool_name" >> "$LOGFILE"
     fi
 
-    # Create or import fastData pool
-    if zpool status fastData >/dev/null 2>&1; then
-        echo "Warning: fastData pool already exists, skipping creation" | tee -a "$LOGFILE"
-        zpool import -d /dev/disk/by-id -f fastData || {
-            echo "Error: Failed to import existing fastData pool" | tee -a "$LOGFILE"
-            exit 1
-        }
-    else
-        echo "Creating ZFS pool fastData (single)..." | tee -a "$LOGFILE"
-        if [[ "$AUTOTRIM_SUPPORTED" == "true" ]]; then
-            zpool create -f -o ashift=12 -o autotrim=on fastData /dev/disk/by-id/"$fastdata_id" || {
-                echo "Failed to create fastData pool" | tee -a "$LOGFILE"
-                exit 1
-            }
-        else
-            zpool create -f -o ashift=12 fastData /dev/disk/by-id/"$fastdata_id" || {
-                echo "Failed to create fastData pool" | tee -a "$LOGFILE"
-                exit 1
-            }
-            echo "Setting up periodic fstrim for fastData..." | tee -a "$LOGFILE"
-            echo "15 3 * * * root fstrim /fastData" > /etc/cron.d/fstrim_fastData
-        fi
-        zfs set compression=lz4 atime=off fastData || {
-            echo "Failed to set properties on fastData pool" | tee -a "$LOGFILE"
-            exit 1
-        }
-        zpool export fastData && zpool import -d /dev/disk/by-id fastData || {
-            echo "Failed to export/import fastData to update cache" | tee -a "$LOGFILE"
-            exit 1
-        }
-    fi
+    # Create datasets for the pool using common function
+    create_zfs_datasets() {
+      local dataset_list=("shared-prod-data" "shared-prod-data-sync" "shared-test-data" "shared-test-data-sync" "backups" "iso" "bulk-data")
+
+      for dataset in "${dataset_list[@]}"; do
+        retry_command "zfs create -o mountpoint=/mnt/pve/$dataset $pool_name/$dataset"
+        echo "[$(date)] Created ZFS dataset: $pool_name/$dataset with mountpoint /mnt/pve/$dataset" >> "$LOGFILE"
+      done
+    }
+
+    create_zfs_datasets
+  fi
+
+  # Create another pool for NFS if needed using common function
+  local nfs_pool="quickOS"
+
+  if zfs_pool_exists "$nfs_pool"; then
+    echo "Pool $nfs_pool already exists, skipping creation." | tee -a "$LOGFILE"
+  else
+    retry_command "zpool create -f $nfs_pool $DATA_DRIVE"
+    echo "[$(date)] Created ZFS pool: $nfs_pool on $DATA_DRIVE" >> "$LOGFILE"
+
+    # Create datasets for the NFS pool using common function
+    local nfs_dataset_list=("shared-prod-data" "shared-prod-data-sync")
+
+    for dataset in "${nfs_dataset_list[@]}"; do
+      retry_command "zfs create -o mountpoint=/quickOS/$dataset $nfs_pool/$dataset"
+      echo "[$(date)] Created ZFS dataset: $nfs_pool/$dataset with mountpoint /quickOS/$dataset" >> "$LOGFILE"
+    done
+  fi
 }
 
-# Tune ARC cache
-tune_arc() {
-    echo "Tuning ARC cache to 24GB..." | tee -a "$LOGFILE"
-    echo "$ARC_MAX" > /sys/module/zfs/parameters/zfs_arc_max
-    echo "options zfs zfs_arc_max=$ARC_MAX" > /etc/modprobe.d/zfs.conf
-}
-
-# Main execution
+# Main execution using common functions
 main() {
-    check_root
-    setup_logging
-    check_zfs_version
-    prompt_for_drives
-    check_drives_free
-    confirm_wipe_drives
-    wipe_drives
-    create_zfs_pools
-    tune_arc
-    echo "ZFS pool setup completed successfully at $(date)" | tee -a "$LOGFILE"
+  check_root
+  install_zfs_packages
+  check_available_drives
+  create_zfs_pools
 }
 
 main

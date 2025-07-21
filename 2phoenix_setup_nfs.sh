@@ -9,6 +9,7 @@
 
 # Source common functions and configuration variables
 source /usr/local/bin/common.sh || { echo "Error: Failed to source common.sh"; exit 1; }
+source /usr/local/bin/phoenix_config.sh || { echo "Error: Failed to source phoenix_config.sh"; exit 1; }
 load_config
 
 # Ensure script runs as root using common function
@@ -21,7 +22,7 @@ check_root() {
 
 # Initialize logging using the configuration setup_logging function
 setup_logging() {
-    mkdir -p "$(dirname "$LOGFILE")" || { echo "Error: Failed to create log directory $(dirname "$LOGFILE")"; exit 1; }
+    mkdir -p "$LOGDIR" || { echo "Error: Failed to create log directory $LOGDIR"; exit 1; }
     touch "$LOGFILE" || { echo "Error: Failed to create log file $LOGFILE"; exit 1; }
     chmod 664 "$LOGFILE" || { echo "Error: Failed to set permissions on $LOGFILE"; exit 1; }
     exec 1> >(tee -a "$LOGFILE")
