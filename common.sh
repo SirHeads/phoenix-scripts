@@ -2,28 +2,27 @@
 
 # common.sh
 # Shared functions for Proxmox VE setup scripts
-# Version: 1.2.4
+# Version: 1.2.6
 # Author: Heads, Grok, Devstral
 # Usage: Source this script in other setup scripts to use common functions
 # Note: Configure log rotation for $LOGFILE using /etc/logrotate.d/proxmox_setup
 
 # Constants
 LOGFILE="/var/log/proxmox_setup.log"
-readonly LOGFILE
 LOGDIR=$(dirname "$LOGFILE")
 
 # Ensure log directory exists and is writable
 setup_logging() {
-  mkdir -p "$LOGDIR" || { echo "Error: Failed to create log directory $LOGDIR"; exit 1; }
-  touch "$LOGFILE" || { echo "Error: Failed to create log file $LOGFILE"; exit 1; }
-  chmod 664 "$LOGFILE" || { echo "Error: Failed to set permissions on $LOGFILE"; exit 1; }
+  mkdir -p "$LOGDIR" || { echo "Error: Failed to create log directory $LOGDIR" | tee -a /dev/stderr; exit 1; }
+  touch "$LOGFILE" || { echo "Error: Failed to create log file $LOGFILE" | tee -a /dev/stderr; exit 1; }
+  chmod 664 "$LOGFILE" || { echo "Error: Failed to set permissions on $LOGFILE" | tee -a /dev/stderr; exit 1; }
   echo "[$(date)] Initialized logging for $(basename "$0")" >> "$LOGFILE"
 }
 
 # Check if script is run as root
 check_root() {
   if [[ $EUID -ne 0 ]]; then
-    echo "Error: This script must be run with sudo" | tee -a "$LOGFILE"
+    echo "Error: This script must be run as root" | tee -a "$LOGFILE"
     exit 1
   fi
 }
@@ -79,7 +78,6 @@ check_internet_connectivity() {
   echo "[$(date)] Internet connectivity to $dns_server verified" >> "$LOGFILE"
 }
 
-# Check if an interface has an IP in the specified subnet
 check_interface_in_subnet() {
   local subnet="$1"
   local found=0
@@ -89,11 +87,33 @@ check_interface_in_subnet() {
     exit 1
   fi
 
+  local subnet_prefix=$(echo "$subnet" | cut -d'/' -f1 | sed 's/\.[0-9]*$/\./')
+  while IFS= read -r line; do
+    if [[ "$line" =~ inet\ (10\.0\.0\.[0-9]+/[0-9]+) ]]; then
+      ip_with_mask="${BASH_REMATCH[1]}"
+      ip=$(echo "$ip_with_mask" | cut -d'/' -f1)
+      if [[ "$ip" =~ ^$subnet_prefix ]]; then
+        found=1
+        echo "[$(date)] Found network interface with IP $ip_with_mask in subnet $subnet" >> "$LOGFILE"
+        break
+      fi
+    fi
+  done < <(ip addr show | grep inet)
+
+  if [[ $found -eq 0 ]]; then
+    echo "Warning: No network interface found in subnet $subnet. NFS may not function correctly." | tee -a "$LOGFILE"
+    return 1
+  fi
+  return 0
+}
+
   # Extract IP addresses from all interfaces
+{  
   while IFS= read -r line; do
     if [[ "$line" =~ inet\ ([0-9]{1,3}\.[0-9]{1,3}\.[0-9]{1,3}\.[0-9]{1,3}/[0-9]{1,2}) ]]; then
       ip_with_mask="${BASH_REMATCH[1]}"
-      # Use ipcalc or similar logic to check if IP is in subnet
+      ip=$(echo "$ip_with_mask" | cut -d'/' -f1)
+      # Use ipcalc if available for precise subnet matching
       if command -v ipcalc >/dev/null 2>&1; then
         if ipcalc -cs "$ip_with_mask" "$subnet"; then
           found=1
@@ -101,9 +121,9 @@ check_interface_in_subnet() {
           break
         fi
       else
-        # Fallback to basic subnet matching if ipcalc is not installed
-        ip=$(echo "$ip_with_mask" | cut -d'/' -f1)
-        if [[ "$ip" =~ ^$(echo "$subnet" | cut -d'/' -f1 | sed 's/\.[0-9]*$/\./') ]]; then
+        # Fallback to basic subnet matching
+        subnet_prefix=$(echo "$subnet" | cut -d'/' -f1 | sed 's/\.[0-9]*$/\./')
+        if [[ "$ip" =~ ^$subnet_prefix ]]; then
           found=1
           echo "[$(date)] Found network interface with IP $ip_with_mask in subnet $subnet (basic match)" >> "$LOGFILE"
           break
@@ -183,20 +203,22 @@ configure_nfs_export() {
 
 # Retry a command multiple times
 retry_command() {
-  local cmd="$@"
+  local cmd="$1"
   local max_attempts=3
   local attempt=0
 
-  until $cmd; do
+  until bash -c "$cmd"; do
     if ((attempt < max_attempts)); then
       echo "[$(date)] Command failed, retrying ($((attempt + 1))/${max_attempts}): $cmd" >> "$LOGFILE"
       ((attempt++))
       sleep 5
     else
       echo "Error: Command failed after ${max_attempts} attempts: $cmd" | tee -a "$LOGFILE"
-      exit 1
+      return 1
     fi
   done
+  echo "[$(date)] Command succeeded: $cmd" >> "$LOGFILE"
+  return 0
 }
 
 # Add user to a group
@@ -210,6 +232,7 @@ add_user_to_group() {
       exit 1
     }
   fi
+  echo "[$(date)] Added user $username to group $group" >> "$LOGFILE"
 }
 
 # Verify NFS exports
@@ -221,7 +244,7 @@ verify_nfs_exports() {
   echo "[$(date)] NFS exports verified" >> "$LOGFILE"
 }
 
-# Check if a ZFS pool exists using common functions
+# Check if a ZFS pool exists
 zfs_pool_exists() {
   local pool="$1"
   if zpool list -H -o name | grep -q "^$pool$"; then
@@ -230,7 +253,7 @@ zfs_pool_exists() {
   return 1
 }
 
-# Check if a ZFS dataset exists using zfs list -H -o name
+# Check if a ZFS dataset exists
 zfs_dataset_exists() {
   local dataset="$1"
   if zfs list -H -o name | grep -q "^$dataset$"; then

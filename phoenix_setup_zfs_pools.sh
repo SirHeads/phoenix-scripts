@@ -1,178 +1,175 @@
 #!/bin/bash
 
 # phoenix_setup_zfs_pools.sh
-# Configures ZFS pools on Proxmox VE
-# Version: 1.2.1
+# Configures ZFS pools (quickOS and fastData) on Proxmox VE for the Phoenix server.
+# Version: 1.2.0
 # Author: Heads, Grok, Devstral
 # Usage: ./phoenix_setup_zfs_pools.sh [-q "quickos_drives"] [-f "fastdata_drive"]
-# Note: Configure log rotation for $LOGFILE using /etc/logrotate.d/proxmox_setup
 
-# Source common functions and configuration variables
-source /usr/local/bin/common.sh || { echo "Error: Failed to source common.sh"; exit 1; }
-source /usr/local/bin/phoenix_config.sh || { echo "Error: Failed to source phoenix_config.sh"; exit 1; }
+# Log file
+LOGFILE="/var/log/proxmox_setup.log"
+TIMESTAMP=$(date '+%Y-%m-%d %H:%M:%S %Z')
+
+# Function to check if the script is running as root
+check_root() {
+    if [[ $EUID -ne 0 ]]; then
+        echo "Error: This script must be run as root" | tee -a "$LOGFILE"
+        exit 1
+    fi
+    echo "[$TIMESTAMP] Verified script is running as root" >> "$LOGFILE"
+}
+
+# Ensure log file exists and is writable
+touch "$LOGFILE" || { echo "Error: Cannot create log file $LOGFILE"; exit 1; }
+chmod 644 "$LOGFILE"
+echo "[$TIMESTAMP] Initialized logging for phoenix_setup_zfs_pools.sh" >> "$LOGFILE"
+
+# Function to execute commands with retries
+retry_command() {
+    local cmd="$1"
+    local max_attempts=3
+    local attempt=1
+    while [ $attempt -le $max_attempts ]; do
+        echo "[$TIMESTAMP] Attempt $attempt/$max_attempts: $cmd" >> "$LOGFILE"
+        eval $cmd
+        if [ $? -eq 0 ]; then
+            echo "[$TIMESTAMP] Command succeeded: $cmd" >> "$LOGFILE"
+            return 0
+        fi
+        echo "[$TIMESTAMP] Command failed, retrying ($attempt/$max_attempts): $cmd" >> "$LOGFILE"
+        sleep 5
+        ((attempt++))
+    done
+    echo "[$TIMESTAMP] Error: Command failed after $max_attempts attempts: $cmd" | tee -a "$LOGFILE"
+    return 1
+}
+
+# Function to check if a drive is available
+check_available_drives() {
+    local drive="$1"
+    if [ ! -b "/dev/$drive" ]; then
+        echo "Error: Drive $drive does not exist" | tee -a "$LOGFILE"
+        exit 1
+    fi
+    if zpool status | grep -q "$drive"; then
+        echo "Error: Drive $drive is already part of a ZFS pool" | tee -a "$LOGFILE"
+        exit 1
+    fi
+    # Log drive type
+    DRIVE_TYPE=$(lsblk -d -o MODEL,TRAN | grep "^${drive}" | awk '{print $2}')
+    if [[ -z "$DRIVE_TYPE" ]]; then
+        echo "[$TIMESTAMP] Drive $drive type could not be determined, proceeding anyway" >> "$LOGFILE"
+    else
+        echo "[$TIMESTAMP] Drive $drive is of type $DRIVE_TYPE" >> "$LOGFILE"
+    fi
+    echo "[$TIMESTAMP] Verified that drive $drive is available" >> "$LOGFILE"
+}
+
+# Function to monitor NVMe wear
+monitor_nvme_wear() {
+    local drives="$@"
+    if command -v smartctl >/dev/null 2>&1; then
+        for drive in $drives; do
+            if lsblk -d -o NAME,TRAN | grep "^${drive}" | grep -q "nvme"; then
+                smartctl -a /dev/$drive | grep -E "Wear_Leveling|Media_Wearout" >> "$LOGFILE" 2>/dev/null
+                echo "[$TIMESTAMP] NVMe wear stats for $drive logged" >> "$LOGFILE"
+            fi
+        done
+    else
+        echo "[$TIMESTAMP] smartctl not installed, skipping NVMe wear monitoring" >> "$LOGFILE"
+    fi
+}
+
+# Function to check system RAM for ZFS ARC
+check_system_ram() {
+    local zfs_arc_max=8589934592  # 8GB in bytes
+    local required_ram=$((zfs_arc_max * 2))
+    local total_ram=$(free -b | awk '/Mem:/ {print $2}')
+    if [[ $total_ram -lt $required_ram ]]; then
+        echo "Warning: System RAM ($((total_ram / 1024 / 1024 / 1024)) GB) is less than twice ZFS_ARC_MAX ($((zfs_arc_max / 1024 / 1024 / 1024)) GB). This may cause memory issues." | tee -a "$LOGFILE"
+        read -p "Continue with current ZFS_ARC_MAX setting? (y/n): " RAM_CONFIRMATION
+        if [[ "$RAM_CONFIRMATION" != "y" && "$RAM_CONFIRMATION" != "Y" ]]; then
+            echo "Error: Aborted due to insufficient RAM for ZFS_ARC_MAX" | tee -a "$LOGFILE"
+            exit 1
+        fi
+    fi
+    echo "[$TIMESTAMP] Verified system RAM ($((total_ram / 1024 / 1024 / 1024)) GB) is sufficient for ZFS_ARC_MAX" >> "$LOGFILE"
+    echo "$zfs_arc_max" > /sys/module/zfs/parameters/zfs_arc_max || { echo "Error: Failed to set zfs_arc_max to $zfs_arc_max" | tee -a "$LOGFILE"; exit 1; }
+    echo "[$TIMESTAMP] Set zfs_arc_max to $zfs_arc_max bytes" >> "$LOGFILE"
+}
 
 # Parse command-line arguments
-while [[ $# -gt 0 ]]; do
-  case $1 in
-    -q)
-      QUICKOS_DRIVES="$2"
-      shift 2
-      ;;
-    -f)
-      FASTDATA_DRIVE="$2"
-      shift 2
-      ;;
-    *)
-      echo "Error: Unknown option $1" | tee -a "$LOGFILE"
-      exit 1
-      ;;
-  esac
+while getopts "q:f:" opt; do
+    case $opt in
+        q) QUICKOS_DRIVES=($OPTARG);;
+        f) FASTDATA_DRIVE="$OPTARG";;
+        \?) echo "Invalid option: -$OPTARG" | tee -a "$LOGFILE"; exit 1;;
+        :) echo "Option -$OPTARG requires an argument" | tee -a "$LOGFILE"; exit 1;;
+    esac
 done
 
-# Ensure script runs as root using common function
-check_root() {
-  if [[ $EUID -ne 0 ]]; then
-    echo "Error: This script must be run with sudo." | tee -a "$LOGFILE"
+# Set defaults and prompt if not provided
+QUICKOS_DRIVES=(${QUICKOS_DRIVES[@]:-nvme1n1 nvme2n1})
+FASTDATA_DRIVE=${FASTDATA_DRIVE:-nvme0n1}
+if [ ${#QUICKOS_DRIVES[@]} -eq 0 ]; then
+    read -p "Enter the drives for quickOS pool (e.g., nvme1n1 nvme2n1): " QUICKOS_DRIVES_INPUT
+    QUICKOS_DRIVES=($QUICKOS_DRIVES_INPUT)
+fi
+if [ -z "$FASTDATA_DRIVE" ]; then
+    read -p "Enter the drive for fastData pool (e.g., nvme0n1): " FASTDATA_DRIVE
+fi
+
+# Validate quickOS drives
+if [ ${#QUICKOS_DRIVES[@]} -ne 2 ]; then
+    echo "Error: Exactly two drives must be specified for quickOS mirror" | tee -a "$LOGFILE"
     exit 1
-  fi
-}
-
-# Initialize logging for consistent behavior
-setup_logging
-
-# Verify the drive exists and isn't part of an existing ZFS pool
-check_available_drives() {
-  local drive="$1"
-
-  # Check if the drive exists
-  if ! lsblk -d -o NAME | grep -q "^${drive}$"; then
-    echo "Error: Drive $drive does not exist." | tee -a "$LOGFILE"
+fi
+if [ "${QUICKOS_DRIVES[0]}" = "${QUICKOS_DRIVES[1]}" ] || [ "${QUICKOS_DRIVES[0]}" = "$FASTDATA_DRIVE" ] || [ "${QUICKOS_DRIVES[1]}" = "$FASTDATA_DRIVE" ]; then
+    echo "Error: All drives must be distinct, got quickOS: ${QUICKOS_DRIVES[*]}, fastData: $FASTDATA_DRIVE" | tee -a "$LOGFILE"
     exit 1
-  fi
-
-  # Log drive type (e.g., NVMe or SATA)
-  DRIVE_TYPE=$(lsblk -d -o MODEL,TRAN | grep "^${drive}" | awk '{print $2}')
-  if [[ -z "$DRIVE_TYPE" ]]; then
-    echo "[$(date)] Drive $drive type could not be determined, proceeding anyway" >> "$LOGFILE"
-  else
-    echo "[$(date)] Drive $drive is of type $DRIVE_TYPE" >> "$LOGFILE"
-  fi
-
-  # Check if the drive is already in use by a ZFS pool
-  if zpool status | grep -q "^[[:space:]]*$drive "; then
-    echo "Error: Drive $drive is already in use by another ZFS pool." | tee -a "$LOGFILE"
-    exit 1
-  fi
-
-  # Verify NVMe firmware is up-to-date
-  if [[ "$DRIVE_TYPE" == "nvme" ]]; then
-    if command -v nvme >/dev/null 2>&1; then
-      nvme id-ctrl /dev/$drive | grep -q "frmw" && echo "[$(date)] NVMe firmware check for $drive: $(nvme id-ctrl /dev/$drive | grep frmw)" >> "$LOGFILE"
-    else
-      echo "[$(date)] nvme-cli not installed, skipping firmware check for $drive" >> "$LOGFILE"
-    fi
-  fi
-
-  echo "[$(date)] Verified that drive $drive is available" >> "$LOGFILE"
-}
-
-# Check system RAM to ensure it's sufficient for ZFS_ARC_MAX
-check_system_ram() {
-  local zfs_arc_max="$ZFS_ARC_MAX"
-  local required_ram=$((zfs_arc_max * 2)) # Require at least 2x ZFS_ARC_MAX
-  local total_ram=$(free -b | awk '/Mem:/ {print $2}')
-
-  if [[ $total_ram -lt $required_ram ]]; then
-    echo "Warning: System RAM ($((total_ram / 1024 / 1024 / 1024)) GB) is less than twice ZFS_ARC_MAX ($((zfs_arc_max / 1024 / 1024 / 1024)) GB). This may cause memory issues." | tee -a "$LOGFILE"
-    read -p "Continue with current ZFS_ARC_MAX setting? (y/n): " RAM_CONFIRMATION
-    if [[ "$RAM_CONFIRMATION" != "y" && "$RAM_CONFIRMATION" != "Y" ]]; then
-      echo "Error: Aborted due to insufficient RAM for ZFS_ARC_MAX." | tee -a "$LOGFILE"
-      exit 1
-    fi
-  fi
-  echo "[$(date)] Verified system RAM ($((total_ram / 1024 / 1024 / 1024)) GB) is sufficient for ZFS_ARC_MAX" >> "$LOGFILE"
-}
-
-# Monitor NVMe wear
-monitor_nvme_wear() {
-  local drives="$@"
-  if command -v smartctl >/dev/null 2>&1; then
-    for drive in $drives; do
-      if lsblk -d -o NAME,TRAN | grep "^${drive}" | grep -q "nvme"; then
-        smartctl -a /dev/$drive | grep -E "Wear_Leveling|Media_Wearout" >> "$LOGFILE" 2>/dev/null
-        echo "[$(date)] NVMe wear stats for $drive logged" >> "$LOGFILE"
-      fi
-    done
-  else
-    echo "[$(date)] smartctl not installed, skipping NVMe wear monitoring" >> "$LOGFILE"
-  fi
-}
-
-# Create ZFS pools
-create_zfs_pools() {
-  # Create quickOS pool (mirrored)
-  if zfs_pool_exists "$QUICKOS_POOL"; then
-    echo "Pool $QUICKOS_POOL already exists, skipping creation" | tee -a "$LOGFILE"
-  else
-    if [[ -z "$QUICKOS_DRIVES" ]] || [[ $(echo "$QUICKOS_DRIVES" | wc -w) -ne 2 ]]; then
-      echo "Error: Exactly two drives required for $QUICKOS_POOL (mirrored)" | tee -a "$LOGFILE"
-      exit 1
-    fi
-    for drive in $QUICKOS_DRIVES; do
-      check_available_drives "$drive"
-    done
-    retry_command "zpool create -f -o autotrim=on -O compression=lz4 -O atime=off $QUICKOS_POOL mirror $QUICKOS_DRIVES"
-    echo "[$(date)] Created ZFS pool: $QUICKOS_POOL on $QUICKOS_DRIVES" >> "$LOGFILE"
-    monitor_nvme_wear "$QUICKOS_DRIVES"
-  fi
-
-  # Create fastData pool (single)
-  if zfs_pool_exists "$FASTDATA_POOL"; then
-    echo "Pool $FASTDATA_POOL already exists, skipping creation" | tee -a "$LOGFILE"
-  else
-    check_available_drives "$FASTDATA_DRIVE"
-    retry_command "zpool create -f -o autotrim=on -O compression=lz4 -O atime=off $FASTDATA_POOL $FASTDATA_DRIVE"
-    echo "[$(date)] Created ZFS pool: $FASTDATA_POOL on $FASTDATA_DRIVE" >> "$LOGFILE"
-    monitor_nvme_wear "$FASTDATA_DRIVE"
-  fi
-
-  # Check system RAM before setting ARC limit
-  check_system_ram
-
-  # Set ARC limit
-  echo "$ZFS_ARC_MAX" > /sys/module/zfs/parameters/zfs_arc_max || {
-    echo "Error: Failed to set zfs_arc_max to $ZFS_ARC_MAX" | tee -a "$LOGFILE"
-    exit 1
-  }
-  echo "[$(date)] Set zfs_arc_max to $ZFS_ARC_MAX bytes" >> "$LOGFILE"
-}
+fi
+echo "[$TIMESTAMP] Set QUICKOS_DRIVES to ${QUICKOS_DRIVES[*]}" >> "$LOGFILE"
+echo "[$TIMESTAMP] Set FASTDATA_DRIVE to $FASTDATA_DRIVE" >> "$LOGFILE"
 
 # Install ZFS packages
-install_zfs_packages() {
-  if ! check_package "zfsutils-linux"; then
-    retry_command "apt-get update"
-    retry_command "apt-get install -y zfsutils-linux smartmontools"
-    echo "[$(date)] Installed zfsutils-linux and smartmontools" >> "$LOGFILE"
-  fi
-}
+if ! command -v zpool >/dev/null 2>&1; then
+    retry_command "apt-get install -y zfsutils-linux smartmontools" || { echo "Error: Failed to install zfsutils-linux and smartmontools" | tee -a "$LOGFILE"; exit 1; }
+    echo "[$TIMESTAMP] Installed zfsutils-linux and smartmontools" >> "$LOGFILE"
+else
+    echo "[$TIMESTAMP] ZFS utilities already installed, skipping installation" >> "$LOGFILE"
+fi
 
-# Main execution
-main() {
-  check_root
-  setup_logging
+# Check available drives
+for drive in "${QUICKOS_DRIVES[@]}" "$FASTDATA_DRIVE"; do
+    check_available_drives "$drive"
+done
 
-  if [[ -z "$QUICKOS_DRIVES" ]]; then
-    read -p "Enter the drives for quickOS pool (e.g., nvme0n1 nvme1n1): " QUICKOS_DRIVES
-  fi
+# Wipe existing partitions
+for drive in "${QUICKOS_DRIVES[@]}" "$FASTDATA_DRIVE"; do
+    retry_command "wipefs -a /dev/$drive" || { echo "Error: Failed to wipe partitions on /dev/$drive" | tee -a "$LOGFILE"; exit 1; }
+    echo "[$TIMESTAMP] Wiped partitions on /dev/$drive" >> "$LOGFILE"
+done
 
-  if [[ -z "$FASTDATA_DRIVE" ]]; then
-    read -p "Enter the drive for fastData pool (e.g., nvme2n1): " FASTDATA_DRIVE
-  fi
+# Create ZFS pools
+if zpool list quickOS >/dev/null 2>&1; then
+    echo "[$TIMESTAMP] Pool quickOS already exists, skipping creation" >> "$LOGFILE"
+else
+    retry_command "zpool create -f -o autotrim=on -O compression=lz4 -O atime=off quickOS mirror ${QUICKOS_DRIVES[0]} ${QUICKOS_DRIVES[1]}" || { echo "Error: Failed to create quickOS pool" | tee -a "$LOGFILE"; exit 1; }
+    echo "[$TIMESTAMP] Created ZFS pool quickOS on ${QUICKOS_DRIVES[*]}" >> "$LOGFILE"
+fi
 
-  install_zfs_packages
-  create_zfs_pools
+if zpool list fastData >/dev/null 2>&1; then
+    echo "[$TIMESTAMP] Pool fastData already exists, skipping creation" >> "$LOGFILE"
+else
+    retry_command "zpool create -f -o autotrim=on -O compression=lz4 -O atime=off fastData $FASTDATA_DRIVE" || { echo "Error: Failed to create fastData pool" | tee -a "$LOGFILE"; exit 1; }
+    echo "[$TIMESTAMP] Created ZFS pool fastData on $FASTDATA_DRIVE" >> "$LOGFILE"
+fi
 
-  echo "[$(date)] Completed ZFS pool setup" >> "$LOGFILE"
-}
+# Monitor NVMe wear
+monitor_nvme_wear "${QUICKOS_DRIVES[*]}" "$FASTDATA_DRIVE"
 
-main
+# Check system RAM and set ARC limit
+check_system_ram
+
+echo "[$TIMESTAMP] Successfully completed phoenix_setup_zfs_pools.sh" >> "$LOGFILE"
+exit 0

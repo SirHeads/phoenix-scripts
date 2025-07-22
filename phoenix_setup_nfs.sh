@@ -1,114 +1,244 @@
+```bash
 #!/bin/bash
 
 # phoenix_setup_nfs.sh
-# Installs and configures NFS server on Proxmox VE
-# Version: 1.0.6
+# Configures NFS server and exports for Proxmox VE
+# Version: 1.0.11
 # Author: Heads, Grok, Devstral
-# Usage: ./phoenix_setup_nfs.sh
+# Usage: ./phoenix_setup_nfs.sh [--no-reboot]
 # Note: Configure log rotation for $LOGFILE using /etc/logrotate.d/proxmox_setup
 
 # Source common functions and configuration variables
-source /usr/local/bin/common.sh || { echo "Error: Failed to source common.sh"; exit 1; }
-source /usr/local/bin/phoenix_config.sh || { echo "Error: Failed to source phoenix_config.sh"; exit 1; }
-load_config
+source /usr/local/bin/common.sh || { echo "Error: Failed to source common.sh" | tee -a /dev/stderr; exit 1; }
+source /usr/local/bin/phoenix_config.sh || { echo "Error: Failed to source phoenix_config.sh" | tee -a /dev/stderr; exit 1; }
 
-# Ensure script runs as root
-check_root() {
-  if [[ $EUID -ne 0 ]]; then
-    echo "Error: This script must be run as root." | tee -a "$LOGFILE"
+# Parse command-line arguments
+NO_REBOOT=false
+while [[ $# -gt 0 ]]; do
+  case $1 in
+    --no-reboot)
+      NO_REBOOT=true
+      shift
+      ;;
+    *)
+      echo "Error: Unknown option $1" | tee -a "$LOGFILE"
+      exit 1
+      ;;
+  esac
+done
+
+# Install NFS packages
+install_nfs_packages() {
+  echo "[$(date '+%Y-%m-%d %H:%M:%S %Z')] Installing NFS packages..." >> "$LOGFILE"
+  if ! retry_command "apt-get install -y nfs-kernel-server nfs-common ufw"; then
+    echo "Error: Failed to install NFS packages" | tee -a "$LOGFILE"
     exit 1
   fi
+  echo "[$(date '+%Y-%m-%d %H:%M:%S %Z')] NFS packages installed" >> "$LOGFILE"
 }
 
-# Check for pvesm availability
-check_pvesm() {
+# Get server IP in NFS_SUBNET
+get_server_ip() {
+  local subnet="${NFS_SUBNET:-10.0.0.0/24}"
+  if ! check_interface_in_subnet "$subnet"; then
+    echo "Error: No network interface found in subnet $subnet" | tee -a "$LOGFILE"
+    exit 1
+  fi
+  local ip
+  ip=$(ip addr show | grep -E "inet.*10\.0\.0\.[0-9]+/24" | awk '{print $2}' | cut -d'/' -f1 | head -1)
+  if [[ -z "$ip" ]]; then
+    echo "Error: Failed to determine server IP in subnet $subnet" | tee -a "$LOGFILE"
+    exit 1
+  fi
+  echo "$ip"
+}
+
+# Configure NFS exports
+configure_nfs_exports() {
+  echo "[$(date '+%Y-%m-%d %H:%M:%S %Z')] Configuring NFS exports..." >> "$LOGFILE"
+  local subnet="${NFS_SUBNET:-10.0.0.0/24}"
+  local exports_file="/etc/exports"
+  local datasets=(
+    "quickOS/vm-disks:/mnt/pve/vm-disks:images"
+    "quickOS/lxc-disks:/mnt/pve/lxc-disks:images"
+    "quickOS/shared-prod-data:/mnt/pve/shared-prod-data:images"
+    "quickOS/shared-prod-data-sync:/mnt/pve/shared-prod-data-sync:images"
+    "fastData/shared-test-data:/mnt/pve/shared-test-data:images"
+    "fastData/shared-backups:/mnt/pve/shared-backups:backup"
+    "fastData/shared-iso:/mnt/pve/shared-iso:iso"
+    "fastData/shared-bulk-data:/mnt/pve/shared-bulk-data:images"
+    "fastData/shared-test-data-sync:/mnt/pve/shared-test-data-sync:images"
+  )
+
+  # Check if quickOS and fastData pools exist
+  if ! zpool list quickOS >/dev/null 2>&1; then
+    echo "Error: ZFS pool quickOS does not exist. Check phoenix_setup_zfs_pools.sh or create_phoenix.sh for pool creation issues." | tee -a "$LOGFILE"
+    exit 1
+  fi
+  if ! zpool list fastData >/dev/null 2>&1; then
+    echo "Error: ZFS pool fastData does not exist. Check phoenix_setup_zfs_pools.sh or create_phoenix.sh for pool creation issues." | tee -a "$LOGFILE"
+    exit 1
+  fi
+  echo "[$(date '+%Y-%m-%d %H:%M:%S %Z')] Verified ZFS pools quickOS and fastData exist" >> "$LOGFILE"
+
+  # Backup existing exports file
+  if [[ -f "$exports_file" ]]; then
+    if ! cp "$exports_file" "$exports_file.bak.$(date +%F_%H-%M-%S)"; then
+      echo "Error: Failed to backup $exports_file" | tee -a "$LOGFILE"
+      exit 1
+    fi
+    echo "[$(date '+%Y-%m-%d %H:%M:%S %Z')] Backed up $exports_file" >> "$LOGFILE"
+  fi
+
+  # Clear existing exports file
+  if ! : > "$exports_file"; then
+    echo "Error: Failed to clear $exports_file" | tee -a "$LOGFILE"
+    exit 1
+  fi
+
+  # Configure exports for each dataset
+  for dataset in "${datasets[@]}"; do
+    IFS=':' read -r zfs_path mount_path content_type <<< "$dataset"
+    if [[ -z "$zfs_path" || -z "$mount_path" || -z "$content_type" ]]; then
+      echo "Error: Invalid dataset format: $dataset" | tee -a "$LOGFILE"
+      exit 1
+    fi
+
+    # Verify ZFS dataset exists
+    if ! zfs list "$zfs_path" >/dev/null 2>&1; then
+      echo "Error: ZFS dataset $zfs_path does not exist. Run phoenix_setup_zfs_datasets.sh to create it." | tee -a "$LOGFILE"
+      echo "Attempting to list available datasets for debugging:" | tee -a "$LOGFILE"
+      zfs list -r "$(dirname "$zfs_path")" 2>&1 | tee -a "$LOGFILE"
+      exit 1
+    fi
+
+    # Create mount point if it doesn't exist
+    if ! mkdir -p "$mount_path"; then
+      echo "Error: Failed to create mount point $mount_path" | tee -a "$LOGFILE"
+      exit 1
+    fi
+
+    # Ensure ZFS dataset is mounted at the correct path
+    if ! mount | grep -q "$mount_path"; then
+      if ! zfs set mountpoint="$mount_path" "$zfs_path"; then
+        echo "Error: Failed to set mountpoint for $zfs_path to $mount_path" | tee -a "$LOGFILE"
+        exit 1
+      fi
+    fi
+
+    # Add export to /etc/exports
+    if ! echo "$mount_path $subnet(rw,sync,no_subtree_check,no_root_squash)" >> "$exports_file"; then
+      echo "Error: Failed to add $mount_path to $exports_file" | tee -a "$LOGFILE"
+      exit 1
+    fi
+    echo "[$(date '+%Y-%m-%d %H:%M:%S %Z')] Added NFS export for $zfs_path at $mount_path" >> "$LOGFILE"
+  done
+
+  # Restart NFS service to apply exports
+  if ! retry_command "exportfs -ra"; then
+    echo "Error: Failed to refresh NFS exports" | tee -a "$LOGFILE"
+    exit 1
+  fi
+  if ! retry_command "systemctl restart nfs-kernel-server"; then
+    echo "Error: Failed to restart NFS service" | tee -a "$LOGFILE"
+    exit 1
+  fi
+  echo "[$(date '+%Y-%m-%d %H:%M:%S %Z')] NFS exports configured and service restarted" >> "$LOGFILE"
+}
+
+# Configure firewall for NFS
+configure_nfs_firewall() {
+  echo "[$(date '+%Y-%m-%d %H:%M:%S %Z')] Configuring firewall for NFS..." >> "$LOGFILE"
+  local subnet="${NFS_SUBNET:-10.0.0.0/24}"
+  if ! retry_command "ufw allow from $subnet to any port nfs"; then
+    echo "Error: Failed to allow NFS in firewall" | tee -a "$LOGFILE"
+    exit 1
+  fi
+  if ! retry_command "ufw allow 111,2049/tcp"; then
+    echo "Error: Failed to allow NFS TCP ports in firewall" | tee -a "$LOGFILE"
+    exit 1
+  fi
+  if ! retry_command "ufw allow 111,2049/udp"; then
+    echo "Error: Failed to allow NFS UDP ports in firewall" | tee -a "$LOGFILE"
+    exit 1
+  fi
+  echo "[$(date '+%Y-%m-%d %H:%M:%S %Z')] Firewall configured for NFS" >> "$LOGFILE"
+}
+
+# Add NFS storage to Proxmox
+add_nfs_storage() {
+  echo "[$(date '+%Y-%m-%d %H:%M:%S %Z')] Adding NFS storage to Proxmox..." >> "$LOGFILE"
   if ! command -v pvesm >/dev/null 2>&1; then
     echo "Error: pvesm command not found. Ensure this script is running on a Proxmox VE system." | tee -a "$LOGFILE"
     exit 1
   fi
-  echo "[$(date)] Verified pvesm availability" >> "$LOGFILE"
-}
+  local server_ip
+  server_ip=$(get_server_ip)
+  local storages=(
+    "nfs-vm-disks:/mnt/pve/vm-disks:images"
+    "nfs-lxc-disks:/mnt/pve/lxc-disks:images"
+    "nfs-shared-prod-data:/mnt/pve/shared-prod-data:images"
+    "nfs-shared-prod-data-sync:/mnt/pve/shared-prod-data-sync:images"
+    "nfs-shared-test-data:/mnt/pve/shared-test-data:images"
+    "nfs-shared-backups:/mnt/pve/shared-backups:backup"
+    "nfs-shared-iso:/mnt/pve/shared-iso:iso"
+    "nfs-shared-bulk-data:/mnt/pve/shared-bulk-data:images"
+    "nfs-shared-test-data-sync:/mnt/pve/shared-test-data-sync:images"
+  )
 
-# Initialize logging
-setup_logging
+  for storage in "${storages[@]}"; do
+    IFS=':' read -r storage_name export_path content_type <<< "$storage"
+    if [[ -z "$storage_name" || -z "$export_path" || -z "$content_type" ]]; then
+      echo "Error: Invalid storage format: $storage" | tee -a "$LOGFILE"
+      exit 1
+    fi
 
-# Prompt for network subnet
-prompt_for_subnet() {
-  read -p "Enter network subnet for NFS (default: ${DEFAULT_SUBNET}): " NFS_SUBNET
-  NFS_SUBNET=${NFS_SUBNET:-$DEFAULT_SUBNET}
-  if ! [[ "$NFS_SUBNET" =~ ^[0-9]{1,3}\.[0-9]{1,3}\.[0-9]{1,3}\.[0-9]{1,3}/[0-9]{1,2}$ ]]; then
-    echo "Error: Invalid subnet format: $NFS_SUBNET" | tee -a "$LOGFILE"
-    exit 1
-  fi
-}
+    # Verify export is active
+    if ! showmount -e "$server_ip" | grep -q "$export_path"; then
+      echo "Error: NFS export $export_path not available on $server_ip" | tee -a "$LOGFILE"
+      exit 1
+    fi
 
-# Check network connectivity
-check_network() {
-  echo "Checking network connectivity..." | tee -a "$LOGFILE"
-
-  if ! ping -c 1 localhost >/dev/null 2>&1; then
-    echo "Warning: Hostname 'localhost' does not resolve to 127.0.0.1. Check /etc/hosts." | tee -a "$LOGFILE"
-  fi
-
-  if [[ -n "$IP_ADDRESS" ]]; then
-    PROXMOX_NFS_SERVER="$IP_ADDRESS"
-    export PROXMOX_NFS_SERVER
-  fi
-
-  check_network_connectivity "$PROXMOX_NFS_SERVER"
-  check_interface_in_subnet "$NFS_SUBNET"
-  check_internet_connectivity
-}
-
-# Install required NFS packages
-install_prerequisites() {
-  if ! check_package nfs-kernel-server; then
-    retry_command "apt-get update && apt-get install -y nfs-kernel-server nfs-common ufw"
-    echo "[$(date)] Installed NFS prerequisites" >> "$LOGFILE"
-  fi
-
-  if ! systemctl is-active --quiet nfs-kernel-server; then
-    retry_command "systemctl start nfs-kernel-server"
-    retry_command "systemctl enable nfs-kernel-server"
-    echo "[$(date)] Started and enabled nfs-kernel-server" >> "$LOGFILE"
-  fi
-}
-
-# Configure NFS server
-configure_nfs() {
-  echo "Configuring NFS exports..." | tee -a "$LOGFILE"
-
-  mkdir -p /mnt/pve || { echo "Error: Failed to create /mnt/pve" | tee -a "$LOGFILE"; exit 1; }
-
-  for dataset in "${NFS_DATASET_LIST[@]}"; do
-    local mountpoint="/mnt/pve/$(basename $dataset)"
-    mkdir -p "$mountpoint"
-
-    local pool=$(dirname $dataset)
-    local dataset_name=$(basename $dataset)
-    if ! zfs_dataset_exists "$pool/$dataset_name"; then
-      echo "Error: Dataset $pool/$dataset_name does not exist, skipping NFS export" | tee -a "$LOGFILE"
+    # Check if storage already exists
+    if pvesm status | grep -q "^$storage_name"; then
+      echo "[$(date '+%Y-%m-%d %H:%M:%S %Z')] Proxmox storage $storage_name already exists, skipping" >> "$LOGFILE"
       continue
     fi
 
-    local export_options="${NFS_DATASET_OPTIONS[$dataset]}"
-    configure_nfs_export "$dataset" "$mountpoint" "$NFS_SUBNET" "$export_options"
-  done
+    # Create a dedicated local mount point for the NFS storage
+    local local_mount="/mnt/nfs/$storage_name"
+    if ! mkdir -p "$local_mount"; then
+      echo "Error: Failed to create local mount point $local_mount" | tee -a "$LOGFILE"
+      exit 1
+    fi
 
-  verify_nfs_exports
+    # Add NFS storage to Proxmox with explicit path
+    if ! retry_command "pvesm add nfs $storage_name --server $server_ip --export $export_path --content $content_type --path $local_mount --options vers=4"; then
+      echo "Error: Failed to add NFS storage $storage_name" | tee -a "$LOGFILE"
+      exit 1
+    fi
+    echo "[$(date '+%Y-%m-%d %H:%M:%S %Z')] Added NFS storage $storage_name for $export_path at $local_mount" >> "$LOGFILE"
+  done
 }
 
 # Main execution
 main() {
-  check_root
   setup_logging
-  check_pvesm
-  prompt_for_subnet
-  check_network
-  install_prerequisites
-  configure_nfs
-
-  echo "[$(date)] Completed NFS server configuration" >> "$LOGFILE"
+  check_root
+  install_nfs_packages
+  configure_nfs_exports
+  configure_nfs_firewall
+  add_nfs_storage
+  if [[ "$NO_REBOOT" == false ]]; then
+    echo "[$(date '+%Y-%m-%d %H:%M:%S %Z')] Forcing reboot to apply NFS changes in 10 seconds. Press Ctrl+C to cancel." | tee -a "$LOGFILE"
+    sleep 10
+    reboot
+  else
+    echo "[$(date '+%Y-%m-%d %H:%M:%S %Z')] Reboot skipped due to --no-reboot flag. Please reboot manually to apply NFS changes." | tee -a "$LOGFILE"
+  fi
 }
 
 main
+echo "[$(date '+%Y-%m-%d %H:%M:%S %Z')] Successfully completed NFS setup" >> "$LOGFILE"
+exit 0
+```
