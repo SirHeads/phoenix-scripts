@@ -2,10 +2,13 @@
 
 # phoenix_setup_zfs_datasets.sh
 # Configures ZFS datasets on Proxmox VE
-# Version: 1.0.7
+# Version: 1.0.8
 # Author: Heads, Grok, Devstral
 # Usage: ./phoenix_setup_zfs_datasets.sh [-q "quickos_dataset_list"] [-f "fastdata_dataset_list"]
 # Note: Configure log rotation for $LOGFILE using /etc/logrotate.d/proxmox_setup
+
+# Unset LOGFILE to avoid readonly conflicts
+unset LOGFILE 2>/dev/null || true
 
 # Source common functions and configuration variables
 source /usr/local/bin/common.sh || { echo "Error: Failed to source common.sh"; exit 1; }
