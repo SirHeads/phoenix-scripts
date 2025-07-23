@@ -81,7 +81,6 @@ get_nvme_drives() {
     echo "${drives[*]}|${drive_info[*]}"
 }
 
-# Function to prompt for ZFS drives
 prompt_for_drives() {
     local valid=false
     local drive_array drive_info drives
@@ -93,14 +92,20 @@ prompt_for_drives() {
         exit 1
     fi
 
+    # Create an array to map indices to drive info
+    declare -A drive_indices
+    local i=1
+    for info in "${drive_array[@]}"; do
+        drive_indices[$i]="$info"
+        ((i++))
+    done
+
     while [[ "$valid" == false ]]; do
         echo "Available NVMe drives:"
-        local i=1
-        for info in "${drive_array[@]}"; do
-            local by_id=$(echo "$info" | cut -d':' -f1)
-            local size=$(echo "$info" | cut -d':' -f2)
-            echo "  $i. $by_id ($size)"
-            ((i++))
+        for index in "${!drive_indices[@]}"; do
+            local by_id=$(echo "${drive_indices[$index]}" | cut -d':' -f1)
+            local size=$(echo "${drive_indices[$index]}" | cut -d':' -f2)
+            echo "  $index. $by_id ($size)"
         done
 
         # Prompt for quickOS drives
@@ -112,11 +117,11 @@ prompt_for_drives() {
             fi
             local num1=$(echo "$quickos_input" | awk '{print $1}')
             local num2=$(echo "$quickos_input" | awk '{print $2}')
-            if [[ $num1 -lt 1 || $num1 -gt ${#drive_array[@]} || $num2 -lt 1 || $num2 -gt ${#drive_array[@]} || $num1 == $num2 ]]; then
-                echo "Error: Invalid or duplicate drive numbers. Choose two different numbers between 1 and ${#drive_array[@]}." | tee -a "$LOGFILE"
+            if [[ $num1 -lt 1 || $num1 -gt ${#drive_indices[@]} || $num2 -lt 1 || $num2 -gt ${#drive_indices[@]} || $num1 == $num2 ]]; then
+                echo "Error: Invalid or duplicate drive numbers. Choose two different numbers between 1 and ${#drive_indices[@]}." | tee -a "$LOGFILE"
                 continue
             fi
-            QUICKOS_DRIVES="${drive_array[$((num1-1))]%%:*} ${drive_array[$((num2-1))]%%:*}"
+            QUICKOS_DRIVES="${drive_indices[$num1]%%:*} ${drive_indices[$num2]%%:*}"
             echo "[$TIMESTAMP] Set QUICKOS_DRIVES to $QUICKOS_DRIVES" >> "$LOGFILE"
         fi
 
@@ -125,13 +130,11 @@ prompt_for_drives() {
             echo "Available NVMe drives (excluding quickOS drives):"
             local quickos1=$(echo "$QUICKOS_DRIVES" | awk '{print $1}')
             local quickos2=$(echo "$QUICKOS_DRIVES" | awk '{print $2}')
-            local i=1
-            for info in "${drive_array[@]}"; do
-                local by_id=$(echo "$info" | cut -d':' -f1)
+            for index in "${!drive_indices[@]}"; do
+                local by_id=$(echo "${drive_indices[$index]}" | cut -d':' -f1)
                 if [[ "$by_id" != "$quickos1" && "$by_id" != "$quickos2" ]]; then
-                    local size=$(echo "$info" | cut -d':' -f2)
-                    echo "  $i. $by_id ($size)"
-                    ((i++))
+                    local size=$(echo "${drive_indices[$index]}" | cut -d':' -f2)
+                    echo "  $index. $by_id ($size)"
                 fi
             done
             read -p "Enter number for fastData pool drive (e.g., 3): " fastdata_input
@@ -139,11 +142,15 @@ prompt_for_drives() {
                 echo "Error: Please enter a single number." | tee -a "$LOGFILE"
                 continue
             fi
-            if [[ $fastdata_input -lt 1 || $fastdata_input -gt ${#drive_array[@]} ]]; then
-                echo "Error: Invalid drive number. Choose a number between 1 and ${#drive_array[@]}." | tee -a "$LOGFILE"
+            if [[ $fastdata_input -lt 1 || $fastdata_input -gt ${#drive_indices[@]} ]]; then
+                echo "Error: Invalid drive number. Choose a number between 1 and ${#drive_indices[@]}." | tee -a "$LOGFILE"
                 continue
             fi
-            FASTDATA_DRIVE="${drive_array[$((fastdata_input-1))]%%:*}"
+            if [[ "${drive_indices[$fastdata_input]%%:*}" == "$quickos1" || "${drive_indices[$fastdata_input]%%:*}" == "$quickos2" ]]; then
+                echo "Error: fastData drive must be different from quickOS drives." | tee -a "$LOGFILE"
+                continue
+            fi
+            FASTDATA_DRIVE="${drive_indices[$fastdata_input]%%:*}"
             echo "[$TIMESTAMP] Set FASTDATA_DRIVE to $FASTDATA_DRIVE" >> "$LOGFILE"
         fi
 
@@ -270,7 +277,7 @@ scripts=(
     "/usr/local/bin/phoenix_create_admin_user.sh -u \"$ADMIN_USERNAME\" -p \"$ADMIN_PASSWORD\""
     "if ! dpkg-query -W zfsutils-linux > /dev/null; then apt-get update && apt-get install -y zfsutils-linux; fi"
     "/usr/local/bin/phoenix_setup_zfs_pools.sh -q \"$QUICKOS_DRIVES\" -f \"$FASTDATA_DRIVE\""
-    "/usr/local/bin/phoenix_setup_zfs_datasets.sh -q \"vm-disks lxc-disks shared-prod-data shared-prod-data-sync\" -f \"shared-test-data shared-backups shared-iso shared-bulk-data shared-test-data-sync\""
+    "/usr/local/bin/phoenix_setup_zfs_datasets.sh"
     "/usr/local/bin/phoenix_setup_nfs.sh --no-reboot"
     "/usr/local/bin/phoenix_setup_samba.sh -p \"$SMB_PASSWORD\""
 )
