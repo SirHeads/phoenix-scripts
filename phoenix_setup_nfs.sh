@@ -1,9 +1,8 @@
-```bash
 #!/bin/bash
 
 # phoenix_setup_nfs.sh
 # Configures NFS server and exports for Proxmox VE
-# Version: 1.0.11
+# Version: 1.0.12
 # Author: Heads, Grok, Devstral
 # Usage: ./phoenix_setup_nfs.sh [--no-reboot]
 # Note: Configure log rotation for $LOGFILE using /etc/logrotate.d/proxmox_setup
@@ -37,15 +36,15 @@ install_nfs_packages() {
   echo "[$(date '+%Y-%m-%d %H:%M:%S %Z')] NFS packages installed" >> "$LOGFILE"
 }
 
-# Get server IP in NFS_SUBNET
+# Get server IP in DEFAULT_SUBNET
 get_server_ip() {
-  local subnet="${NFS_SUBNET:-10.0.0.0/24}"
+  local subnet="${DEFAULT_SUBNET:-10.0.0.0/24}"
   if ! check_interface_in_subnet "$subnet"; then
     echo "Error: No network interface found in subnet $subnet" | tee -a "$LOGFILE"
     exit 1
   fi
   local ip
-  ip=$(ip addr show | grep -E "inet.*10\.0\.0\.[0-9]+/24" | awk '{print $2}' | cut -d'/' -f1 | head -1)
+  ip=$(ip addr show | grep -E "inet.*$(echo "$subnet" | cut -d'/' -f1)" | awk '{print $2}' | cut -d'/' -f1 | head -1)
   if [[ -z "$ip" ]]; then
     echo "Error: Failed to determine server IP in subnet $subnet" | tee -a "$LOGFILE"
     exit 1
@@ -56,19 +55,8 @@ get_server_ip() {
 # Configure NFS exports
 configure_nfs_exports() {
   echo "[$(date '+%Y-%m-%d %H:%M:%S %Z')] Configuring NFS exports..." >> "$LOGFILE"
-  local subnet="${NFS_SUBNET:-10.0.0.0/24}"
+  local subnet="${DEFAULT_SUBNET:-10.0.0.0/24}"
   local exports_file="/etc/exports"
-  local datasets=(
-    "quickOS/vm-disks:/mnt/pve/vm-disks:images"
-    "quickOS/lxc-disks:/mnt/pve/lxc-disks:images"
-    "quickOS/shared-prod-data:/mnt/pve/shared-prod-data:images"
-    "quickOS/shared-prod-data-sync:/mnt/pve/shared-prod-data-sync:images"
-    "fastData/shared-test-data:/mnt/pve/shared-test-data:images"
-    "fastData/shared-backups:/mnt/pve/shared-backups:backup"
-    "fastData/shared-iso:/mnt/pve/shared-iso:iso"
-    "fastData/shared-bulk-data:/mnt/pve/shared-bulk-data:images"
-    "fastData/shared-test-data-sync:/mnt/pve/shared-test-data-sync:images"
-  )
 
   # Check if quickOS and fastData pools exist
   if ! zpool list quickOS >/dev/null 2>&1; then
@@ -97,12 +85,10 @@ configure_nfs_exports() {
   fi
 
   # Configure exports for each dataset
-  for dataset in "${datasets[@]}"; do
-    IFS=':' read -r zfs_path mount_path content_type <<< "$dataset"
-    if [[ -z "$zfs_path" || -z "$mount_path" || -z "$content_type" ]]; then
-      echo "Error: Invalid dataset format: $dataset" | tee -a "$LOGFILE"
-      exit 1
-    fi
+  for dataset in "${NFS_DATASET_LIST[@]}"; do
+    local zfs_path="$dataset"
+    local mount_path="$MOUNT_POINT_BASE/$(echo "$dataset" | tr '/' '-')"
+    local options="${NFS_DATASET_OPTIONS[$dataset]:-rw,sync,no_subtree_check,noatime}"
 
     # Verify ZFS dataset exists
     if ! zfs list "$zfs_path" >/dev/null 2>&1; then
@@ -127,11 +113,11 @@ configure_nfs_exports() {
     fi
 
     # Add export to /etc/exports
-    if ! echo "$mount_path $subnet(rw,sync,no_subtree_check,no_root_squash)" >> "$exports_file"; then
+    if ! echo "$mount_path $subnet($options)" >> "$exports_file"; then
       echo "Error: Failed to add $mount_path to $exports_file" | tee -a "$LOGFILE"
       exit 1
     fi
-    echo "[$(date '+%Y-%m-%d %H:%M:%S %Z')] Added NFS export for $zfs_path at $mount_path" >> "$LOGFILE"
+    echo "[$(date '+%Y-%m-%d %H:%M:%S %Z')] Added NFS export for $zfs_path at $mount_path with options $options" >> "$LOGFILE"
   done
 
   # Restart NFS service to apply exports
@@ -149,7 +135,7 @@ configure_nfs_exports() {
 # Configure firewall for NFS
 configure_nfs_firewall() {
   echo "[$(date '+%Y-%m-%d %H:%M:%S %Z')] Configuring firewall for NFS..." >> "$LOGFILE"
-  local subnet="${NFS_SUBNET:-10.0.0.0/24}"
+  local subnet="${DEFAULT_SUBNET:-10.0.0.0/24}"
   if ! retry_command "ufw allow from $subnet to any port nfs"; then
     echo "Error: Failed to allow NFS in firewall" | tee -a "$LOGFILE"
     exit 1
@@ -174,23 +160,20 @@ add_nfs_storage() {
   fi
   local server_ip
   server_ip=$(get_server_ip)
-  local storages=(
-    "nfs-vm-disks:/mnt/pve/vm-disks:images"
-    "nfs-lxc-disks:/mnt/pve/lxc-disks:images"
-    "nfs-shared-prod-data:/mnt/pve/shared-prod-data:images"
-    "nfs-shared-prod-data-sync:/mnt/pve/shared-prod-data-sync:images"
-    "nfs-shared-test-data:/mnt/pve/shared-test-data:images"
-    "nfs-shared-backups:/mnt/pve/shared-backups:backup"
-    "nfs-shared-iso:/mnt/pve/shared-iso:iso"
-    "nfs-shared-bulk-data:/mnt/pve/shared-bulk-data:images"
-    "nfs-shared-test-data-sync:/mnt/pve/shared-test-data-sync:images"
-  )
 
-  for storage in "${storages[@]}"; do
-    IFS=':' read -r storage_name export_path content_type <<< "$storage"
-    if [[ -z "$storage_name" || -z "$export_path" || -z "$content_type" ]]; then
-      echo "Error: Invalid storage format: $storage" | tee -a "$LOGFILE"
-      exit 1
+  for dataset in "${NFS_DATASET_LIST[@]}"; do
+    local storage_name="nfs-$(echo "$dataset" | tr '/' '-')"
+    local export_path="$MOUNT_POINT_BASE/$(echo "$dataset" | tr '/' '-')"
+    local storage_info="${DATASET_STORAGE_TYPES[$dataset]}"
+    if [[ -z "$storage_info" ]]; then
+      echo "[$(date '+%Y-%m-%d %H:%M:%S %Z')] Skipping $dataset for NFS storage (not defined in DATASET_STORAGE_TYPES)" >> "$LOGFILE"
+      continue
+    fi
+    local storage_type=$(echo "$storage_info" | cut -d':' -f1)
+    local content_type=$(echo "$storage_info" | cut -d':' -f2)
+    if [[ "$storage_type" != "nfs" ]]; then
+      echo "[$(date '+%Y-%m-%d %H:%M:%S %Z')] Skipping $dataset for NFS storage (defined as $storage_type)" >> "$LOGFILE"
+      continue
     fi
 
     # Verify export is active
@@ -217,7 +200,7 @@ add_nfs_storage() {
       echo "Error: Failed to add NFS storage $storage_name" | tee -a "$LOGFILE"
       exit 1
     fi
-    echo "[$(date '+%Y-%m-%d %H:%M:%S %Z')] Added NFS storage $storage_name for $export_path at $local_mount" >> "$LOGFILE"
+    echo "[$(date '+%Y-%m-%d %H:%M:%S %Z')] Added NFS storage $storage_name for $export_path at $local_mount with content $content_type" >> "$LOGFILE"
   done
 }
 
@@ -241,4 +224,3 @@ main() {
 main
 echo "[$(date '+%Y-%m-%d %H:%M:%S %Z')] Successfully completed NFS setup" >> "$LOGFILE"
 exit 0
-```

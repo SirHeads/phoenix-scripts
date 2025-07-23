@@ -2,15 +2,11 @@
 
 # phoenix_config.sh
 # Configuration variables for Proxmox VE setup scripts
-# Version: 1.2.2
+# Version: 1.2.4
 # Author: Heads, Grok, Devstral
 
 # Source common functions
 source /usr/local/bin/common.sh || { echo "Error: Failed to source common.sh" | tee -a /dev/stderr; exit 1; }
-
-# Define log file location
-# grok said comment out:LOGFILE="/var/log/proxmox_setup.log"
-# grok said comment out:export LOGFILE
 
 # Load configuration variables from environment or defaults
 load_config() {
@@ -68,6 +64,21 @@ load_config() {
   FASTDATA_DATASET_LIST=("shared-test-data" "shared-backups" "shared-iso" "shared-bulk-data" "shared-test-data-sync")
   export FASTDATA_DATASET_LIST
 
+  # Define storage types and content types for Proxmox storage
+  declare -A DATASET_STORAGE_TYPES
+  DATASET_STORAGE_TYPES=(
+    ["quickOS/vm-disks"]="zfspool:images"
+    ["quickOS/lxc-disks"]="zfspool:images"
+    ["fastData/shared-backups"]="dir:backup"
+    ["fastData/shared-iso"]="dir:iso"
+    ["quickOS/shared-prod-data"]="nfs:images"
+    ["quickOS/shared-prod-data-sync"]="nfs:images"
+    ["fastData/shared-test-data"]="nfs:images"
+    ["fastData/shared-bulk-data"]="nfs:images"
+    ["fastData/shared-test-data-sync"]="nfs:images"
+  )
+  export DATASET_STORAGE_TYPES
+
   # Define NFS dataset lists with specific export options
   declare -A NFS_DATASET_OPTIONS
   NFS_DATASET_OPTIONS=(
@@ -79,7 +90,7 @@ load_config() {
     ["fastData/shared-bulk-data"]="rw,async,no_subtree_check,noatime"
     ["fastData/shared-test-data-sync"]="rw,sync,no_subtree_check,noatime"
   )
-  NFS_DATASET_LIST=("quickOS/shared-prod-data" "quickOS/shared-prod-data-sync" "fastData/shared-test-data" "fastData/shared-iso" "fastData/shared-bulk-data" "fastData/shared-backups" "fastData/shared-test-data-sync")
+  NFS_DATASET_LIST=("quickOS/shared-prod-data" "quickOS/shared-prod-data-sync" "fastData/shared-test-data" "fastData/shared-iso" "fastData/shared-backups" "fastData/shared-bulk-data" "fastData/shared-test-data-sync")
   export NFS_DATASET_LIST
 
   # Define base mount point for datasets

@@ -2,7 +2,7 @@
 
 # phoenix_setup_zfs_datasets.sh
 # Configures ZFS datasets on Proxmox VE
-# Version: 1.0.8
+# Version: 1.2.2
 # Author: Heads, Grok, Devstral
 # Usage: ./phoenix_setup_zfs_datasets.sh [-q "quickos_dataset_list"] [-f "fastdata_dataset_list"]
 # Note: Configure log rotation for $LOGFILE using /etc/logrotate.d/proxmox_setup
@@ -11,8 +11,8 @@
 unset LOGFILE 2>/dev/null || true
 
 # Source common functions and configuration variables
-source /usr/local/bin/common.sh || { echo "Error: Failed to source common.sh"; exit 1; }
-source /usr/local/bin/phoenix_config.sh || { echo "Error: Failed to source phoenix_config.sh"; exit 1; }
+source /usr/local/bin/common.sh || { echo "Error: Failed to source common.sh" | tee -a /dev/stderr; exit 1; }
+source /usr/local/bin/phoenix_config.sh || { echo "Error: Failed to source phoenix_config.sh" | tee -a /dev/stderr; exit 1; }
 load_config
 
 # Parse command-line arguments
@@ -35,25 +35,21 @@ while getopts ":q:f:" opt; do
   esac
 done
 
-# Ensure script runs as root
-check_root() {
-  if [[ $EUID -ne 0 ]]; then
-    echo "Error: This script must be run with sudo." | tee -a "$LOGFILE"
-    exit 1
-  fi
-}
+# Ensure script runs only once
+STATE_FILE="/var/log/proxmox_setup_state"
+if grep -Fx "phoenix_setup_zfs_datasets" "$STATE_FILE" >/dev/null 2>&1; then
+  echo "[$(date '+%Y-%m-%d %H:%M:%S %Z')] phoenix_setup_zfs_datasets already executed, skipping" >> "$LOGFILE"
+  exit 0
+fi
 
 # Check for pvesm availability
 check_pvesm() {
   if ! command -v pvesm >/dev/null 2>&1; then
-    echo "Error: pvesm command not found. Ensure this script is running on a Proxmox VE system." | tee -a "$LOGFILE"
+    echo "[$(date '+%Y-%m-%d %H:%M:%S %Z')] Error: pvesm command not found" | tee -a "$LOGFILE"
     exit 1
   fi
-  echo "[$(date)] Verified pvesm availability" >> "$LOGFILE"
+  echo "[$(date '+%Y-%m-%d %H:%M:%S %Z')] Verified pvesm availability" >> "$LOGFILE"
 }
-
-# Initialize logging
-setup_logging
 
 # Create datasets for quickOS pool
 create_quickos_datasets() {
@@ -72,14 +68,14 @@ create_quickos_datasets() {
 
       if ! zfs_dataset_exists "$pool/$dataset"; then
         create_zfs_dataset "$pool" "$dataset" "$mountpoint" "${zfs_properties[@]}"
-        echo "[$(date)] Created ZFS dataset: $pool/$dataset with mountpoint $mountpoint" >> "$LOGFILE"
+        echo "[$(date '+%Y-%m-%d %H:%M:%S %Z')] Created ZFS dataset: $pool/$dataset with mountpoint $mountpoint" >> "$LOGFILE"
       else
         set_zfs_properties "$pool/$dataset" "${zfs_properties[@]/-o /}"
-        echo "[$(date)] Updated properties for ZFS dataset: $pool/$dataset" >> "$LOGFILE"
+        echo "[$(date '+%Y-%m-%d %H:%M:%S %Z')] Updated properties for ZFS dataset: $pool/$dataset" >> "$LOGFILE"
       fi
     done
   else
-    echo "Error: Pool $pool does not exist." | tee -a "$LOGFILE"
+    echo "[$(date '+%Y-%m-%d %H:%M:%S %Z')] Error: Pool $pool does not exist" | tee -a "$LOGFILE"
     exit 1
   fi
 }
@@ -101,30 +97,140 @@ create_fastdata_datasets() {
 
       if ! zfs_dataset_exists "$pool/$dataset"; then
         create_zfs_dataset "$pool" "$dataset" "$mountpoint" "${zfs_properties[@]}"
-        echo "[$(date)] Created ZFS dataset: $pool/$dataset with mountpoint $mountpoint" >> "$LOGFILE"
+        echo "[$(date '+%Y-%m-%d %H:%M:%S %Z')] Created ZFS dataset: $pool/$dataset with mountpoint $mountpoint" >> "$LOGFILE"
       else
         set_zfs_properties "$pool/$dataset" "${zfs_properties[@]/-o /}"
-        echo "[$(date)] Updated properties for ZFS dataset: $pool/$dataset" >> "$LOGFILE"
+        echo "[$(date '+%Y-%m-%d %H:%M:%S %Z')] Updated properties for ZFS dataset: $pool/$dataset" >> "$LOGFILE"
       fi
     done
   else
-    echo "Error: Pool $pool does not exist." | tee -a "$LOGFILE"
+    echo "[$(date '+%Y-%m-%d %H:%M:%S %Z')] Error: Pool $pool does not exist" | tee -a "$LOGFILE"
     exit 1
   fi
 }
 
-# Add datasets as Proxmox storage
+# Add Proxmox storage
 add_proxmox_storage() {
   check_pvesm
 
-  # Add quickOS/vm-disks and quickOS/lxc-disks as ZFS storage
-  for dataset in "vm-disks" "lxc-disks"; do
+  # Process quickOS datasets
+  for dataset in "${QUICKOS_DATASET_LIST[@]}"; do
+    local full_dataset="quickOS/$dataset"
+    echo "[$(date '+%Y-%m-%d %H:%M:%S %Z')] DEBUG: Processing dataset $full_dataset" >> "$LOGFILE"
+    local storage_info="${DATASET_STORAGE_TYPES[$full_dataset]}"
+    echo "[$(date '+%Y-%m-%d %H:%M:%S %Z')] DEBUG: storage_info='$storage_info' for $full_dataset" >> "$LOGFILE"
+    
+    # Check if storage_info is empty or invalid
+    if [[ -z "$storage_info" ]]; then
+      echo "[$(date '+%Y-%m-%d %H:%M:%S %Z')] ERROR: No storage info defined for $full_dataset, skipping" >> "$LOGFILE"
+      continue
+    fi
+    if ! echo "$storage_info" | grep -q ":"; then
+      echo "[$(date '+%Y-%m-%d %H:%M:%S %Z')] ERROR: Invalid storage_info format for $full_dataset: '$storage_info', skipping" >> "$LOGFILE"
+      continue
+    fi
+
+    local storage_type=$(echo "$storage_info" | cut -d':' -f1)
+    local content_type=$(echo "$storage_info" | cut -d':' -f2)
+    echo "[$(date '+%Y-%m-%d %H:%M:%S %Z')] DEBUG: storage_type='$storage_type', content_type='$content_type' for $full_dataset" >> "$LOGFILE"
+
+    # Validate storage_type and content_type
+    if [[ -z "$storage_type" || -z "$content_type" ]]; then
+      echo "[$(date '+%Y-%m-%d %H:%M:%S %Z')] ERROR: Invalid storage_type or content_type for $full_dataset, skipping" >> "$LOGFILE"
+      continue
+    fi
+
     local storage_id="zfs-$(echo "$dataset" | tr '/' '-')"
+    echo "[$(date '+%Y-%m-%d %H:%M:%S %Z')] DEBUG: storage_id='$storage_id' for $full_dataset" >> "$LOGFILE"
+
     if ! pvesm status | grep -q "^$storage_id"; then
-      retry_command "pvesm add zfspool $storage_id -pool $QUICKOS_POOL/$dataset -content images"
-      echo "[$(date)] Added Proxmox ZFS storage: $storage_id for $QUICKOS_POOL/$dataset" >> "$LOGFILE"
+      echo "[$(date '+%Y-%m-%d %H:%M:%S %Z')] DEBUG: Adding storage $storage_id" >> "$LOGFILE"
+      if [[ "$storage_type" == "dir" ]]; then
+        local mountpoint="$MOUNT_POINT_BASE/$dataset"
+        if ! mountpoint -q "$mountpoint"; then
+          echo "[$(date '+%Y-%m-%d %H:%M:%S %Z')] DEBUG: Setting mountpoint $mountpoint for $QUICKOS_POOL/$dataset" >> "$LOGFILE"
+          zfs set mountpoint="$mountpoint" "$QUICKOS_POOL/$dataset" || {
+            echo "[$(date '+%Y-%m-%d %H:%M:%S %Z')] ERROR: Failed to set mountpoint $mountpoint for $QUICKOS_POOL/$dataset" >> "$LOGFILE"
+            exit 1
+          }
+          zfs mount "$QUICKOS_POOL/$dataset" || {
+            echo "[$(date '+%Y-%m-%d %H:%M:%S %Z')] ERROR: Failed to mount $QUICKOS_POOL/$dataset" >> "$LOGFILE"
+            exit 1
+          }
+        fi
+        echo "[$(date '+%Y-%m-%d %H:%M:%S %Z')] DEBUG: Running pvesm add $storage_type $storage_id -path $mountpoint -content $content_type" >> "$LOGFILE"
+        retry_command "pvesm add $storage_type $storage_id -path $mountpoint -content $content_type" || {
+          echo "[$(date '+%Y-%m-%d %H:%M:%S %Z')] ERROR: Failed to add $storage_type storage $storage_id" >> "$LOGFILE"
+          exit 1
+        }
+        echo "[$(date '+%Y-%m-%d %H:%M:%S %Z')] Added Proxmox $storage_type storage: $storage_id for $mountpoint with content $content_type" >> "$LOGFILE"
+      else
+        echo "[$(date '+%Y-%m-%d %H:%M:%S %Z')] DEBUG: Running pvesm add $storage_type $storage_id -pool $QUICKOS_POOL/$dataset -content $content_type" >> "$LOGFILE"
+        retry_command "pvesm add $storage_type $storage_id -pool $QUICKOS_POOL/$dataset -content $content_type" || {
+          echo "[$(date '+%Y-%m-%d %H:%M:%S %Z')] ERROR: Failed to add $storage_type storage $storage_id" >> "$LOGFILE"
+          exit 1
+        }
+        echo "[$(date '+%Y-%m-%d %H:%M:%S %Z')] Added Proxmox $storage_type storage: $storage_id for $QUICKOS_POOL/$dataset with content $content_type" >> "$LOGFILE"
+      fi
     else
-      echo "[$(date)] Proxmox storage $storage_id already exists, skipping" >> "$LOGFILE"
+      echo "[$(date '+%Y-%m-%d %H:%M:%S %Z')] Proxmox storage $storage_id already exists, skipping" >> "$LOGFILE"
+    fi
+  done
+
+  # Process fastData datasets
+  for dataset in "${FASTDATA_DATASET_LIST[@]}"; do
+    local full_dataset="fastData/$dataset"
+    echo "[$(date '+%Y-%m-%d %H:%M:%S %Z')] DEBUG: Processing dataset $full_dataset" >> "$LOGFILE"
+    local storage_info="${DATASET_STORAGE_TYPES[$full_dataset]}"
+    echo "[$(date '+%Y-%m-%d %H:%M:%S %Z')] DEBUG: storage_info='$storage_info' for $full_dataset" >> "$LOGFILE"
+    
+    if [[ -z "$storage_info" ]]; then
+      echo "[$(,date '+%Y-%m-%d %H:%M:%S %Z')] Skipping $full_dataset for Proxmox storage (likely handled by NFS)" >> "$LOGFILE"
+      continue
+    fi
+    if ! echo "$storage_info" | grep -q ":"; then
+      echo "[$(date '+%Y-%m-%d %H:%M:%S %Z')] ERROR: Invalid storage_info format for $full_dataset: '$storage_info', skipping" >> "$LOGFILE"
+      continue
+    fi
+
+    local storage_type=$(echo "$storage_info" | cut -d':' -f1)
+    local content_type=$(echo "$storage_info" | cut -d':' -f2)
+    echo "[$(date '+%Y-%m-%d %H:%M:%S %Z')] DEBUG: storage_type='$storage_type', content_type='$content_type' for $full_dataset" >> "$LOGFILE"
+
+    local storage_id="zfs-$(echo "$dataset" | tr '/' '-')"
+    echo "[$(date '+%Y-%m-%d %H:%M:%S %Z')] DEBUG: storage_id='$storage_id' for $full_dataset" >> "$LOGFILE"
+
+    if ! pvesm status | grep -q "^$storage_id"; then
+      echo "[$(date '+%Y-%m-%d %H:%M:%S %Z')] DEBUG: Adding storage $storage_id" >> "$LOGFILE"
+      if [[ "$storage_type" == "dir" ]]; then
+        local mountpoint="$MOUNT_POINT_BASE/$dataset"
+        if ! mountpoint -q "$mountpoint"; then
+          echo "[$(date '+%Y-%m-%d %H:%M:%S %Z')] DEBUG: Setting mountpoint $mountpoint for $FASTDATA_POOL/$dataset" >> "$LOGFILE"
+          zfs set mountpoint="$mountpoint" "$FASTDATA_POOL/$dataset" || {
+            echo "[$(date '+%Y-%m-%d %H:%M:%S %Z')] ERROR: Failed to set mountpoint $mountpoint for $FASTDATA_POOL/$dataset" >> "$LOGFILE"
+            exit 1
+          }
+          zfs mount "$FASTDATA_POOL/$dataset" || {
+            echo "[$(date '+%Y-%m-%d %H:%M:%S %Z')] ERROR: Failed to mount $FASTDATA_POOL/$dataset" >> "$LOGFILE"
+            exit 1
+          }
+        fi
+        echo "[$(date '+%Y-%m-%d %H:%M:%S %Z')] DEBUG: Running pvesm add $storage_type $storage_id -path $mountpoint -content $content_type" >> "$LOGFILE"
+        retry_command "pvesm add $storage_type $storage_id -path $mountpoint -content $content_type" || {
+          echo "[$(date '+%Y-%m-%d %H:%M:%S %Z')] ERROR: Failed to add $storage_type storage $storage_id" >> "$LOGFILE"
+          exit 1
+        }
+        echo "[$(date '+%Y-%m-%d %H:%M:%S %Z')] Added Proxmox $storage_type storage: $storage_id for $mountpoint with content $content_type" >> "$LOGFILE"
+      else
+        echo "[$(date '+%Y-%m-%d %H:%M:%S %Z')] DEBUG: Running pvesm add $storage_type $storage_id -pool $FASTDATA_POOL/$dataset -content $content_type" >> "$LOGFILE"
+        retry_command "pvesm add $storage_type $storage_id -pool $FASTDATA_POOL/$dataset -content $content_type" || {
+          echo "[$(date '+%Y-%m-%d %H:%M:%S %Z')] ERROR: Failed to add $storage_type storage $storage_id" >> "$LOGFILE"
+          exit 1
+        }
+        echo "[$(date '+%Y-%m-%d %H:%M:%S %Z')] Added Proxmox $storage_type storage: $storage_id for $FASTDATA_POOL/$dataset with content $content_type" >> "$LOGFILE"
+      fi
+    else
+      echo "[$(date '+%Y-%m-%d %H:%M:%S %Z')] Proxmox storage $storage_id already exists, skipping" >> "$LOGFILE"
     fi
   done
 }
@@ -136,8 +242,8 @@ main() {
   create_quickos_datasets
   create_fastdata_datasets
   add_proxmox_storage
-
-  echo "[$(date)] Completed ZFS dataset setup" >> "$LOGFILE"
+  echo "phoenix_setup_zfs_datasets" >> "$STATE_FILE"
+  echo "[$(date '+%Y-%m-%d %H:%M:%S %Z')] Completed ZFS dataset setup" >> "$LOGFILE"
 }
 
 main
