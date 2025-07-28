@@ -1,160 +1,163 @@
-# Phoenix Scripts for Proxmox VE Setup
+# Phoenix Proxmox VE Server Setup Scripts
+
+Automate the configuration and provisioning of a Proxmox Virtual Environment (VE) server named "Phoenix". This collection of Bash scripts streamlines the setup process for a specific hardware and use-case scenario, focusing on ZFS storage, NVIDIA GPU support, and shared data access via Samba. (NFS setup is included but storage pools/datasets for it are disabled in the current 3-drive configuration).
 
 ## Overview
-The Phoenix Scripts project provides a robust suite of Bash scripts to automate the configuration of a Proxmox Virtual Environment (VE) server. Developed by SirHeads, these scripts streamline the setup of a virtualization platform optimized for AI, machine learning, and development workloads. The scripts handle system configuration, NVIDIA driver installation, admin user creation, ZFS storage pools, NFS, and Samba services, ensuring a secure, efficient, and production-ready server.
 
-## Features
-The Phoenix Scripts automate the following tasks on a Proxmox VE 8.x server:
-- **Initial System Configuration**: Updates packages, sets timezone and NTP, configures static networking, and secures the server with UFW firewall rules.
-- **NVIDIA Driver Installation**: Installs NVIDIA driver (version 575.57.08) and CUDA (version 12.9) for GPU-accelerated virtualization, with automatic GPU detection.
-- **Admin User Creation**: Creates a secure admin user with sudo and Proxmox admin privileges, supporting optional SSH key setup.
-- **ZFS Storage Setup**: Configures two ZFS pools (`quickOS` for mirrored NVMe drives, `fastData` for a single drive) with datasets for VMs, containers, shared data, and backups.
-- **NFS Server Configuration**: Sets up an NFS server with exports for all datasets in `NFS_DATASET_LIST`, integrated with Proxmox storage.
-- **Samba File Sharing**: Configures Samba shares for cross-platform access to shared datasets, secured with user authentication.
-- **Orchestration**: A master script (`master_setup.sh`) ensures correct execution order, dependency checks, and state tracking for reliable setup.
+The "Phoenix" setup aims to transform a fresh Proxmox VE installation into a ready-to-use server with a predefined storage layout, user accounts, network configuration, and essential services. The core storage utilizes ZFS for data integrity and performance, organized into distinct pools for operating system/data and bulk storage. The scripts handle initial OS configuration, ZFS pool and dataset creation, Proxmox storage definition, user and group management, and service setup (like Samba).
 
-## Requirements
-To use the Phoenix Scripts, ensure the following:
-- **Hardware**:
-  - A server with Proxmox VE 8.x installed (based on Debian 12).
-  - At least two NVMe drives for the `quickOS` mirrored pool and one drive for the `fastData` pool.
-  - An optional NVIDIA GPU compatible with driver version 575.57.08.
-  - Network connectivity with a valid subnet (e.g., `192.168.0.0/24`) and a static IP for the server.
-- **Software**:
-  - Proxmox VE environment with root access.
-  - Internet access for downloading packages and the script tarball.
-  - `wget`, `tar`, and `bash` (included by default in Proxmox VE).
-- **Permissions**:
-  - Root access to execute scripts.
-  - Write permissions for `/usr/local/bin/` and `/var/log/`.
-- **Configuration**:
-  - Optionally edit `phoenix_config.sh` to customize `PROXMOX_NFS_SERVER`, `DEFAULT_SUBNET`, `QUICKOS_DRIVES`, or `FASTDATA_DRIVE`.
+## Getting Started
 
-## Installation
-Follow these steps to download, deploy, and execute the Phoenix Scripts:
+These instructions will guide you through preparing your Proxmox host and executing the automation scripts.
 
-1. **Download the Script Package**:
-   ```bash
-   wget https://github.com/SirHeads/phoenix-scripts/archive/refs/tags/v0.10.02.tar.gz -O phoenix-scripts-v0.10.02.tar.gz
-   ```
+### Prerequisites
 
-2. **Extract the Scripts**:
-   ```bash
-   tar -xzf phoenix-scripts-v0.10.02.tar.gz
-   ```
+1.  **Fresh Proxmox VE Installation:** Start with a clean installation of Proxmox VE (tested with version 8.x). The target system should have at least 3 NVMe SSDs for the intended ZFS configuration.
+2.  **Root Access:** You must have root (`sudo su -` or direct root login) access to the Proxmox host to execute these scripts.
+3.  **Internet Connection:** The host needs internet access during the setup process to download packages and updates.
+4.  **SSH Key (Optional but Recommended):** Have your public SSH key ready if you intend to add it to the new admin user account.
 
-3. **Copy Scripts to `/usr/local/bin`**:
-   ```bash
-   sudo mkdir -p /usr/local/bin
-   sudo cp phoenix-scripts-0.10.02/*.sh /usr/local/bin/
-   sudo chmod +x /usr/local/bin/*.sh
-   ```
+### Installation
 
-4. **Configure Log Rotation**:
-   Create a logrotate configuration to manage `/var/log/proxmox_setup.log`:
-   ```bash
-   sudo bash -c 'cat << EOF > /etc/logrotate.d/proxmox_setup
-   /var/log/proxmox_setup.log {
-       weekly
-       rotate 4
-       compress
-       missingok
-       notifempty
-       create 664 root adm
-   }
-   EOF'
-   ```
+1.  **Download the Scripts:**
+    Download and extract the latest release of the Phoenix scripts to the Proxmox host. You can do this directly on the host using `wget` and `tar`.
 
-5. **Run the Master Setup Script**:
-   Execute as root to orchestrate the setup:
-   ```bash
-   sudo bash /usr/local/bin/master_setup.sh
-   ```
+    ```bash
+    # Download the release archive (replace vX.XX.XX with the desired version if different)
+    wget https://github.com/SirHeads/phoenix-scripts/archive/refs/tags/v0.09.10.tar.gz
 
-6. **Monitor Progress**:
-   View real-time logs:
-   ```bash
-   tail -f /var/log/proxmox_setup.log
-   ```
+    # Extract the archive
+    tar -xzf v0.09.10.tar.gz
 
-7. **Verify Setup**:
-   Confirm successful configuration:
-   - System updates: `apt list --upgradable`
-   - NVIDIA driver: `nvidia-smi`
-   - Admin user: `id $ADMIN_USERNAME` (default: `adminuser`)
-   - ZFS pools: `zpool list`
-   - ZFS datasets: `zfs list`
-   - NFS exports: `exportfs -v`
-   - Samba shares: `testparm`
+    # Navigate into the extracted directory
+    cd phoenix-scripts-0.09.10
+    ```
+
+2.  **Install the Scripts:**
+    Copy the script files to the designated location (`/usr/local/bin`) and ensure they are executable.
+
+    ```bash
+    # Copy scripts to /usr/local/bin (requires root)
+    sudo cp *.sh /usr/local/bin/
+
+    # Make the scripts executable (requires root)
+    sudo chmod +x /usr/local/bin/*.sh
+    ```
+
+3.  **Run the Orchestrator Script:**
+    Execute the main orchestrator script. It will prompt you for necessary configuration details like admin user credentials, SMB password, drive selections, and network settings.
+
+    ```bash
+    # Run the main setup script (requires root)
+    sudo /usr/local/bin/create_phoenix.sh
+    ```
+
+    **Follow the on-screen prompts carefully.**
 
 ## Script Details
-The `master_setup.sh` script orchestrates the following scripts in order:
 
-1. **`phoenix_proxmox_initial_setup.sh`** (v1.0.5):
-   - Updates system packages, configures timezone, NTP, and static networking.
-   - Sets up UFW with rules for SSH (22), Proxmox GUI (8006), NFS (2049, 111), and Samba (137, 138, 139, 445).
-   - Exports `IP_ADDRESS` for NFS server configuration.
+Here's a breakdown of the key scripts involved in the Phoenix setup process:
 
-2. **`phoenix_install_nvidia_driver.sh`** (v1.0.4):
-   - Installs NVIDIA driver and CUDA if an NVIDIA GPU is detected (`lspci | grep -i nvidia`).
-   - Uses `--no-reboot` to avoid interrupting setup.
-   - Verifies driver installation with `nvidia-smi`.
+*   **`create_phoenix.sh` (Orchestrator):**
+    The main script that coordinates the entire setup. It sources configuration and common functions, validates root privileges, prompts for user input (admin credentials, drive selection, network config), validates selected drives, and executes the subsequent setup scripts in the correct order. It uses a state file (`/tmp/phoenix_setup_state`) to track completed steps, allowing potential resumption or reruns by skipping already successful stages. It also handles logging the overall process.
 
-3. **`phoenix_create_admin_user.sh`** (v1.0.4):
-   - Creates a user (default: `adminuser`) with sudo and Proxmox admin privileges.
-   - Supports optional SSH key setup and validates password security (8+ characters, 1 special character).
+*   **`phoenix_config.sh` (Configuration):**
+    Defines global variables and configurations used across the scripts. This includes:
+    *   ZFS pool names (`quickOS`, `fastData`).
+    *   Lists of ZFS datasets to create within each pool (`QUICKOS_DATASET_LIST`, `FASTDATA_DATASET_LIST`).
+    *   Associative arrays defining ZFS properties (like `compression`, `recordsize`, `sync`, `quota`, `atime`) for each dataset (`QUICKOS_DATASET_PROPERTIES`, `FASTDATA_DATASET_PROPERTIES`).
+    *   Mappings between datasets and their intended Proxmox storage types/IDs (`DATASET_STORAGE_TYPES`).
+    *   The default SMB user name (`SMB_USER`).
+    *   (NFS configuration is present but largely disabled for the 3-drive setup).
 
-4. **`phoenix_setup_zfs_pools.sh`** (v1.0.4):
-   - Creates `quickOS` (mirrored pool on two NVMe drives) and `fastData` (single drive pool).
-   - Validates drive availability and sets ZFS ARC limit to 30GB (requires 60GB+ RAM).
-   - Prompts for drives if not set in `phoenix_config.sh`.
+*   **`common.sh` (Shared Functions):**
+    Contains reusable functions used by multiple setup scripts to perform common tasks and maintain consistency. Key functions include:
+    *   Logging setup (`setup_logging`).
+    *   Root user checks (`check_root`).
+    *   Package installation checks (`check_package`).
+    *   Network interface validation (`check_interface_in_subnet`).
+    *   ZFS pool/dataset creation and property setting (`create_zfs_pool`, `create_zfs_dataset`, `set_zfs_properties`).
+    *   NFS export configuration (`configure_nfs_export`).
+    *   Command execution with retry logic (`retry_command`).
+    *   User and group management helpers (`create_system_user`, `add_user_to_groups`).
 
-5. **`phoenix_setup_zfs_datasets.sh`** (v1.0.5):
-   - Creates datasets on `quickOS` (`vm-disks`, `lxc-disks`, `shared-prod-data`, `shared-prod-data-sync`, `shared-backups`) and `fastData` (`shared-test-data`, `shared-iso`, `shared-bulk-data`).
-   - Sets mount points to `/mnt/pve/<dataset>` and integrates with Proxmox storage (`pvesm`).
+*   **`phoenix_proxmox_initial_setup.sh` (Initial OS Setup):**
+    Performs fundamental OS-level configurations and installations:
+    *   Disables Proxmox subscription repositories and adds no-subscription repos.
+    *   Performs a full `apt update` and `dist-upgrade`.
+    *   Installs essential tools (`s-tui`, `ufw`, `chrony`, `Samba`).
+    *   Prompts for and sets the hostname and static network configuration (IP, Gateway, Interface, DNS).
+    *   Configures the `ufw` firewall to allow necessary services (SSH, Proxmox UI on 8006/tcp, NFS, Samba).
+    *   Sets the system timezone (default: America/New_York) and configures NTP using `chrony`.
+    *   Sets up log rotation for the setup log file.
 
-6. **`phoenix_setup_nfs.sh`** (v1.0.5):
-   - Installs and configures an NFS server with exports for all datasets in `NFS_DATASET_LIST` (e.g., `quickOS/shared-prod-data`, `fastData/shared-test-data`).
-   - Validates network connectivity using `check_network_connectivity` and `check_interface_in_subnet`.
-   - Integrates NFS shares with Proxmox storage.
+*   **`phoenix_install_nvidia_driver.sh` (NVIDIA Driver Installation):**
+    Handles the installation of NVIDIA GPU drivers using the official NVIDIA runfile installer:
+    *   Downloads the specified NVIDIA driver version (e.g., 535.129.03).
+    *   Disables the open-source Nouveau driver.
+    *   Stops the display manager.
+    *   Runs the NVIDIA installer in silent mode.
+    *   Regenerates the initramfs to ensure the new driver is loaded on boot.
 
-7. **`phoenix_setup_samba.sh`** (v1.0.4):
-   - Configures Samba shares for `shared-prod-data`, `shared-prod-data-sync`, and `shared-backups`.
-   - Uses the admin user created by `phoenix_create_admin_user.sh` for authentication.
-   - Sets firewall rules for Samba ports.
+*   **`phoenix_create_admin_user.sh` (Admin User Creation):**
+    Creates a non-root administrative user account:
+    *   Takes username, password, and an optional SSH public key as arguments (though typically called by the orchestrator which provides these).
+    *   Creates the user with a home directory (`/home/<username>`) and `/bin/bash` shell.
+    *   Adds the user to privileged groups (`sudo`, `adm`, `wheel`).
+    *   Sets the specified password for the user.
+    *   If an SSH key is provided, it creates the user's `~/.ssh` directory, sets appropriate permissions, and adds the key to `~/.ssh/authorized_keys`.
+    *   Optionally creates a corresponding user within Proxmox VE (`<username>@pve`) and sets its password.
 
-8. **`phoenix_config.sh`** (v1.2.1):
-   - Defines variables like `PROXMOX_NFS_SERVER`, `DEFAULT_SUBNET`, `QUICKOS_DATASET_LIST`, and `FASTDATA_DATASET_LIST`.
-   - Validates IP and subnet formats for reliability.
+*   **`phoenix_setup_zfs_pools.sh` (ZFS Pool Creation):**
+    Creates the ZFS storage pools based on the configuration and user-selected drives:
+    *   For the 3-drive setup: Creates a mirrored `quickOS` pool using two drives and a single-drive `fastData` pool using the third.
+    *   Handles drive validation and ensures selected drives are not currently in use by existing ZFS pools or contain existing filesystems/partitions.
+    *   Uses the validated drive paths passed from the orchestrator.
 
-9. **`common.sh`** (v1.2.4):
-   - Provides shared functions for error handling, logging, ZFS operations, and network checks (`check_network_connectivity`, `check_internet_connectivity`, `check_interface_in_subnet`).
-   - Ensures consistent behavior across all scripts.
+*   **`phoenix_setup_zfs_datasets.sh` (ZFS Dataset Creation):**
+    Creates the predefined ZFS datasets within the `quickOS` and `fastData` pools as specified in `phoenix_config.sh`:
+    *   Iterates through the dataset lists (`QUICKOS_DATASET_LIST`, `FASTDATA_DATASET_LIST`).
+    *   Creates each dataset under its respective pool.
+    *   Applies the defined ZFS properties (`compression`, `recordsize`, etc.) to each dataset using the `set_zfs_properties` function from `common.sh`.
 
-10. **`master_setup.sh`** (v1.1.0):
-    - Orchestrates script execution with state tracking (`/var/log/proxmox_setup_state`).
-    - Prompts for admin credentials and ZFS drives if not predefined.
-    - Ensures dependencies (e.g., `zfsutils-linux`) and handles reboots with a systemd service.
+*   **`phoenix_create_storage.sh` (Proxmox Storage Integration):**
+    Integrates the created ZFS datasets and directories into Proxmox VE as storage definitions:
+    *   Reads the `DATASET_STORAGE_TYPES` mapping from `phoenix_config.sh`.
+    *   Determines if a dataset should be added as a ZFS Pool storage (`zfspool:images/rootdir`) or Directory storage (`dir:backup,iso,images,vztmpl`) in Proxmox.
+    *   Uses `pvesm add` to create the storage entries in Proxmox, linking them to the actual ZFS paths or mountpoints.
+    *   Assigns appropriate content types (`images`, `backup`, `iso`, `rootdir`, `vztmpl`) based on the configuration.
 
-## Notes
-- **Execution Order**: Scripts must run in the order defined in `master_setup.sh` to satisfy dependencies (e.g., ZFS pools before datasets, network setup before NFS).
-- **Error Handling**: Scripts include retries, detailed logging to `/var/log/proxmox_setup.log`, and validation for inputs (e.g., IPs, drives, usernames).
-- **Customization**: Edit `phoenix_config.sh` to adjust `PROXMOX_NFS_SERVER`, `DEFAULT_SUBNET`, or drive settings. `master_setup.sh` prompts for unset values.
-- **Security**: Passwords require 8+ characters with at least one special character. UFW rules restrict access to necessary services.
-- **Hardware**: Verify NVMe drive names (e.g., `nvme0n1`, `nvme1n1`, `sdb`) using `lsblk`. Ensure 60GB+ RAM for ZFS ARC settings.
+*   **`phoenix_setup_nfs.sh` (NFS Server Configuration - Partially Disabled):**
+    Configures the host to act as an NFS server:
+    *   Installs required NFS packages (`nfs-kernel-server`).
+    *   Configures the firewall (`ufw`) to allow NFS traffic.
+    *   While the script framework is present and runs, the actual creation of NFS export datasets is disabled in the current `phoenix_config.sh` for the 3-drive setup. The datasets intended for NFS (`shared-prod-data`, `shared-prod-data-sync`, `shared-test-data`, `shared-bulk-data`) are instead created as local ZFS datasets within `quickOS` or `fastData` pools. The script skips configuring exports for non-existent pools/datasets.
+    *   (If enabled) It would configure `/etc/exports`, restart the NFS service, and potentially add the NFS shares as storage within Proxmox.
 
-## Troubleshooting
-- **Log File**: Check `/var/log/proxmox_setup.log` for errors and progress.
-- **Script Failures**: Verify prerequisites (e.g., internet, drive availability). Rerun `master_setup.sh` to resume from the last completed step.
-- **NVIDIA Issues**: Confirm GPU detection (`lspci | grep -i nvidia`) and driver status (`nvidia-smi`).
-- **ZFS Issues**: Check pool status (`zpool status`) and dataset mounts (`zfs list`). Use `--force-wipe` in `phoenix_setup_zfs_pools.sh` if drives have existing partitions.
-- **NFS/Samba Issues**: Verify services (`systemctl status nfs-kernel-server smbd nmbd`) and firewall rules (`ufw status`). Test NFS exports (`exportfs -v`) and Samba shares (`smbclient -L //$PROXMOX_NFS_SERVER`).
+*   **`phoenix_setup_samba.sh` (Samba Server Configuration):**
+    Configures the Samba service to share specific local ZFS datasets created under `fastData` and `quickOS`:
+    *   Creates the SMB user account (default: `smbuser`).
+    *   Prompts for and sets the SMB password.
+    *   Configures the `/etc/samba/smb.conf` file with share definitions for datasets like `shared-backups`, `shared-iso`, `shared-test-data`, `shared-bulk-data`, `shared-prod-data`, and `shared-prod-data-sync`, applying appropriate permissions and settings.
+    *   Restarts the Samba services (`smbd`, `nmbd`) to apply the configuration.
 
 ## Contributing
-Contributions are welcome! Fork the repository, make changes, and submit a pull request. Ensure compatibility with Proxmox VE 8.x and consistent logging to `/var/log/proxmox_setup.log`.
+
+Contributions to improve the scripts or documentation are welcome. Please fork the repository and submit a pull request.
+
+## Versioning
+
+We use [SemVer](http://semver.org/) for versioning. For the versions available, see the [tags on this repository](https://github.com/SirHeads/phoenix-scripts/tags).
+
+## Authors
+
+*   **Heads**
+*   **Grok**
+*   **Devstral**
+*   **Qwen3-coder**
+
+See also the list of [contributors](https://github.com/SirHeads/phoenix-scripts/contributors) who participated in this project.
 
 ## License
-This project is licensed under the MIT License. See the [LICENSE](LICENSE) file for details.
 
-## Contact
-For questions or feedback, visit the [GitHub Issues](https://github.com/SirHeads/phoenix-scripts/issues) page.
+Specify your license here. For example: `GPL-3.0`. Please add a `LICENSE` file to your repository if you choose a specific license.
