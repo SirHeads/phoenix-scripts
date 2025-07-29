@@ -1,4 +1,5 @@
 # Phoenix Proxmox VE Server Setup Scripts
+**Version: v0.10.01**
 
 Automate the configuration and provisioning of a Proxmox Virtual Environment (VE) server named "Phoenix". This collection of Bash scripts streamlines the setup process for a specific hardware and use-case scenario, focusing on ZFS storage, NVIDIA GPU support, and shared data access via Samba. (NFS setup is included but storage pools/datasets for it are disabled in the current 3-drive configuration).
 
@@ -6,16 +7,18 @@ Automate the configuration and provisioning of a Proxmox Virtual Environment (VE
 
 The "Phoenix" setup aims to transform a fresh Proxmox VE installation into a ready-to-use server with a predefined storage layout, user accounts, network configuration, and essential services. The core storage utilizes ZFS for data integrity and performance, organized into distinct pools for operating system/data and bulk storage. The scripts handle initial OS configuration, ZFS pool and dataset creation, Proxmox storage definition, user and group management, and service setup (like Samba).
 
+This version (v0.10.01) integrates the visual "Phoenix Flying" animation at the end of the main setup process (`create_phoenix.sh`) and automatically reboots the system once the setup is complete, indicating that the initial configuration is finished and root access is no longer strictly required for subsequent management via the configured admin user.
+
 ## Getting Started
 
 These instructions will guide you through preparing your Proxmox host and executing the automation scripts.
 
 ### Prerequisites
 
-1.  **Fresh Proxmox VE Installation:** Start with a clean installation of Proxmox VE (tested with version 8.x). The target system should have at least 3 NVMe SSDs for the intended ZFS configuration.
-2.  **Root Access:** You must have root (`sudo su -` or direct root login) access to the Proxmox host to execute these scripts.
-3.  **Internet Connection:** The host needs internet access during the setup process to download packages and updates.
-4.  **SSH Key (Optional but Recommended):** Have your public SSH key ready if you intend to add it to the new admin user account.
+*   **Fresh Proxmox VE Installation**: Start with a clean installation of Proxmox VE (tested with version 8.x). The target system should have at least 3 NVMe SSDs for the intended ZFS configuration.
+*   **Root Access**: You must have root (`sudo su -` or direct root login) access to the Proxmox host to execute these scripts.
+*   **Internet Connection**: The host needs internet access during the setup process to download packages and updates.
+*   **SSH Key (Optional but Recommended)**: Have your public SSH key ready if you intend to add it to the new admin user account.
 
 ### Installation
 
@@ -24,13 +27,13 @@ These instructions will guide you through preparing your Proxmox host and execut
 
     ```bash
     # Download the release archive (replace vX.XX.XX with the desired version if different)
-    wget https://github.com/SirHeads/phoenix-scripts/archive/refs/tags/v0.09.10.tar.gz
+    wget https://github.com/SirHeads/phoenix-scripts/archive/refs/tags/v0.10.01.tar.gz
 
     # Extract the archive
-    tar -xzf v0.09.10.tar.gz
+    tar -xzf v0.10.01.tar.gz
 
     # Navigate into the extracted directory
-    cd phoenix-scripts-0.09.10
+    cd phoenix-scripts-0.10.01
     ```
 
 2.  **Install the Scripts:**
@@ -38,10 +41,10 @@ These instructions will guide you through preparing your Proxmox host and execut
 
     ```bash
     # Copy scripts to /usr/local/bin (requires root)
-    sudo cp *.sh /usr/local/bin/
+    cp *.sh /usr/local/bin/
 
     # Make the scripts executable (requires root)
-    sudo chmod +x /usr/local/bin/*.sh
+    chmod +x /usr/local/bin/*.sh
     ```
 
 3.  **Run the Orchestrator Script:**
@@ -49,17 +52,16 @@ These instructions will guide you through preparing your Proxmox host and execut
 
     ```bash
     # Run the main setup script (requires root)
-    sudo /usr/local/bin/create_phoenix.sh
+    /usr/local/bin/create_phoenix.sh
     ```
-
-    **Follow the on-screen prompts carefully.**
+    Follow the on-screen prompts carefully. The script will perform all setup steps and, upon successful completion, display an animation and automatically reboot the server.
 
 ## Script Details
 
 Here's a breakdown of the key scripts involved in the Phoenix setup process:
 
 *   **`create_phoenix.sh` (Orchestrator):**
-    The main script that coordinates the entire setup. It sources configuration and common functions, validates root privileges, prompts for user input (admin credentials, drive selection, network config), validates selected drives, and executes the subsequent setup scripts in the correct order. It uses a state file (`/tmp/phoenix_setup_state`) to track completed steps, allowing potential resumption or reruns by skipping already successful stages. It also handles logging the overall process.
+    The main script that coordinates the entire setup. It sources configuration and common functions, validates root privileges, prompts for user input (admin credentials, drive selection, network config), validates selected drives, and executes the subsequent setup scripts in the correct order. It uses a state file (`/var/log/proxmox_setup_state`) to track completed steps, allowing potential resumption or reruns by skipping already successful stages. It also handles logging the overall process. **(v0.10.01+) At the end of a successful run, it now executes the `phoenix_fly.sh` animation and triggers a system reboot.**
 
 *   **`phoenix_config.sh` (Configuration):**
     Defines global variables and configurations used across the scripts. This includes:
@@ -71,15 +73,10 @@ Here's a breakdown of the key scripts involved in the Phoenix setup process:
     *   (NFS configuration is present but largely disabled for the 3-drive setup).
 
 *   **`common.sh` (Shared Functions):**
-    Contains reusable functions used by multiple setup scripts to perform common tasks and maintain consistency. Key functions include:
-    *   Logging setup (`setup_logging`).
-    *   Root user checks (`check_root`).
-    *   Package installation checks (`check_package`).
-    *   Network interface validation (`check_interface_in_subnet`).
-    *   ZFS pool/dataset creation and property setting (`create_zfs_pool`, `create_zfs_dataset`, `set_zfs_properties`).
-    *   NFS export configuration (`configure_nfs_export`).
-    *   Command execution with retry logic (`retry_command`).
-    *   User and group management helpers (`create_system_user`, `add_user_to_groups`).
+    Contains reusable functions used by multiple setup scripts to perform common tasks and maintain consistency. (Note: In v0.10.01+, the animation logic has been moved to `phoenix_fly.sh`).
+
+*   **`phoenix_fly.sh` (Animation - New in v0.10.01+):**
+    A standalone script that displays the "Phoenix Flying" animation. It is called by `create_phoenix.sh` at the end of the setup process.
 
 *   **`phoenix_proxmox_initial_setup.sh` (Initial OS Setup):**
     Performs fundamental OS-level configurations and installations:
@@ -151,12 +148,11 @@ We use [SemVer](http://semver.org/) for versioning. For the versions available, 
 
 ## Authors
 
-*   **Heads**
-*   **Grok**
-*   **Devstral**
-*   **Qwen3-coder**
-
-See also the list of [contributors](https://github.com/SirHeads/phoenix-scripts/contributors) who participated in this project.
+*   Heads
+*   Grok
+*   Devstral
+*   Qwen3-coder (Assistance with v0.10.01 updates)
+*   See also the list of [contributors](https://github.com/SirHeads/phoenix-scripts/contributors) who participated in this project.
 
 ## License
 

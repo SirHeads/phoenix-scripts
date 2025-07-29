@@ -1,26 +1,21 @@
 #!/bin/bash
 # create_phoenix.sh
 # Orchestrates the execution of all Proxmox VE setup scripts for the Phoenix server
-# Version: 1.2.9 (Integrated phoenix_create_storage.sh)
+# Version: 1.3.0 (Integrated phoenix_create_storage.sh, Added phoenix_fly.sh and reboot)
 # Author: Heads, Grok, Devstral
-
 # --- Configuration ---
 # Log file and state file
 LOGFILE="/var/log/proxmox_setup.log"
 STATE_FILE="/var/log/proxmox_setup_state"
-
 # --- Function Definitions ---
 # Source common functions and configuration
 source /usr/local/bin/common.sh || { echo "Error: Failed to source common.sh" | tee -a "$LOGFILE"; exit 1; }
 echo "[$(date)] Common functions sourced" >> "$LOGFILE"
-
 source /usr/local/bin/phoenix_config.sh || { echo "Error: Failed to source phoenix_config.sh" | tee -a "$LOGFILE"; exit 1; }
 echo "[$(date)] Configuration file sourced" >> "$LOGFILE"
-
 # Load configuration variables (this will validate and set defaults)
 load_config
 echo "[$(date)] Configuration variables loaded and validated" >> "$LOGFILE"
-
 # Function to check if the script is running as root
 check_root() {
     if [[ $EUID -ne 0 ]]; then
@@ -29,7 +24,6 @@ check_root() {
     fi
     echo "[$(date)] Verified script is running as root" >> "$LOGFILE"
 }
-
 # Function to prompt for admin credentials (if not already set)
 prompt_for_credentials() {
     # --- Prompt for Admin User Credentials ---
@@ -38,7 +32,6 @@ prompt_for_credentials() {
         ADMIN_USERNAME=${ADMIN_USERNAME:-heads}
         echo "[$(date)] Set ADMIN_USERNAME to $ADMIN_USERNAME" >> "$LOGFILE"
     fi
-
     if [[ -z "$ADMIN_PASSWORD" ]]; then
         read -s -p "Enter password for admin user (min 8 chars, 1 special char) [Kick@$$2025]: " ADMIN_PASSWORD
         echo
@@ -50,7 +43,6 @@ prompt_for_credentials() {
         fi
         echo "[$(date)] Set ADMIN_PASSWORD (validated)" >> "$LOGFILE"
     fi
-
     # --- Prompt for SMB Password ---
     if [[ -z "$SMB_PASSWORD" ]]; then
         read -s -p "Enter password for SMB user ($SMB_USER) [Kick@$$2025]: " SMB_PASSWORD
@@ -63,7 +55,6 @@ prompt_for_credentials() {
         fi
         echo "[$(date)] Set SMB_PASSWORD (validated)" >> "$LOGFILE"
     fi
-
     # --- Prompt for SSH Public Key ---
     if [[ -z "$ADMIN_SSH_PUBLIC_KEY" ]]; then
         read -p "Enter path to SSH public key file for admin user (or press Enter to skip): " ADMIN_SSH_PUBLIC_KEY_PATH
@@ -76,69 +67,55 @@ prompt_for_credentials() {
         fi
     fi
 }
-
 # Function to prompt for drive selection (if not already set)
 prompt_for_drives() {
-
     # Check if drives are already provided (e.g., from environment or previous run)
     if [[ -n "$QUICKOS_DRIVES_INPUT" ]] && [[ -n "$FASTDATA_DRIVE_INPUT" ]]; then
         echo "[$(date)] Drive selections provided via environment variables, skipping prompts." >> "$LOGFILE"
         return 0
     fi
-
     # --- Improved Drive Selection Logic ---
     # Discover available NVMe drives by-id, prioritizing model/serial format
     # 1. Get potential drives (filtering out partition links)
     mapfile -t all_nvme_links < <(ls -1 /dev/disk/by-id/nvme-* 2>/dev/null | grep -v -E '\-part[0-9]+$' || true)
-
     if [[ ${#all_nvme_links[@]} -eq 0 ]]; then
         echo "[$(date)] Error: No NVMe drives found in /dev/disk/by-id/" | tee -a "$LOGFILE"
         exit 1
     fi
-
     # 2. Deduplicate by underlying device node (/dev/nvme*)
     # Use associative array to store the "best" symlink per device node
     declare -A best_link_for_device
-
     for link_path in "${all_nvme_links[@]}"; do
         # Resolve the symlink to the actual device node (e.g., /dev/nvme0n1)
         device_node=$(readlink -f "$link_path" 2>/dev/null)
         if [[ -z "$device_node" ]] || [[ ! -b "$device_node" ]]; then
             continue # Skip if it doesn't resolve to a block device
         fi
-
         link_name=$(basename "$link_path")
-
         # Criteria for "best" link:
         # Prefer links containing model/serial (Samsung_SSD_...) over generic EUI ones
         current_is_model_serial=false
         if [[ "$link_name" == nvme-*Samsung* || "$link_name" == nvme-*Crucial* || "$link_name" == nvme-*Intel* || "$link_name" == nvme-*WD* ]]; then
              current_is_model_serial=true
         fi
-
         existing_link="${best_link_for_device[$device_node]}"
-
         # If no link stored yet for this device, or if current link is better (model/serial vs EUI)
         if [[ -z "$existing_link" ]] || { [[ "$current_is_model_serial" == true ]] && [[ "$existing_link" != nvme-*Samsung* ]] && [[ "$existing_link" != nvme-*Crucial* ]] && [[ "$existing_link" != nvme-*Intel* ]] && [[ "$existing_link" != nvme-*WD* ]]; }; then
             best_link_for_device["$device_node"]="$link_path"
         fi
     done
-
     # 3. Convert the associative array values (best links) into a list
     available_drives=()
     for drive_link_path in "${best_link_for_device[@]}"; do
          available_drives+=("$drive_link_path")
     done
-
     # Check if we ended up with any drives after deduplication
     if [[ ${#available_drives[@]} -eq 0 ]]; then
         echo "[$(date)] Error: No usable NVMe drives found after deduplication." | tee -a "$LOGFILE"
         exit 1
     fi
-
     # Optional: Sort the final list for consistent presentation
     # mapfile -t available_drives < <(printf '%s\n' "${available_drives[@]}" | sort)
-
     echo "Available NVMe drives:"
     for i in "${!available_drives[@]}"; do
         # Get size using lsblk (assuming /dev/disk/by-id/ links to /dev/)
@@ -146,7 +123,6 @@ prompt_for_drives() {
         size=$(lsblk -dn -o SIZE "$drive_path" 2>/dev/null || echo "Unknown")
         echo "  $((i+1)). ${available_drives[$i]##*/} ($size)"
     done
-
     # --- Select drives for quickOS pool (Mirror) ---
     while true; do
         read -p "Enter two numbers for quickOS pool drives (e.g., 1 2): " QUICKOS_DRIVES_INPUT
@@ -167,7 +143,6 @@ prompt_for_drives() {
         fi
         echo "Invalid input. Please enter two different numbers corresponding to available drives."
     done
-
     # --- Select drive for fastData pool ---
     # Build list of remaining drives (excluding selected quickOS drives)
     remaining_drives=()
@@ -176,19 +151,16 @@ prompt_for_drives() {
             remaining_drives+=("$drive")
         fi
     done
-
     if [[ ${#remaining_drives[@]} -eq 0 ]]; then
         echo "[$(date)] Error: No remaining drives available for fastData pool." | tee -a "$LOGFILE"
         exit 1
     fi
-
     echo "Available NVMe drives (excluding quickOS drives):"
     for i in "${!remaining_drives[@]}"; do
         drive_path=$(readlink -f "${remaining_drives[$i]}")
         size=$(lsblk -dn -o SIZE "$drive_path" 2>/dev/null || echo "Unknown")
         echo "  $((i+1)). ${remaining_drives[$i]##*/} ($size)"
     done
-
     while true; do
         read -p "Enter number for fastData pool drive (e.g., 3): " FASTDATA_DRIVE_INPUT
         # Basic validation (check if input is a single number)
@@ -202,7 +174,6 @@ prompt_for_drives() {
         fi
         echo "Invalid input. Please enter a number corresponding to an available drive."
     done
-
     # Export validated full paths for use in subsequent scripts
     # These are the variables the ZFS pool script expects
     export QUICKOS_DRIVE1 QUICKOS_DRIVE2 FASTDATA_DRIVE
@@ -211,14 +182,11 @@ prompt_for_drives() {
     FASTDATA_DRIVE_VALIDATED="$FASTDATA_DRIVE"
     export QUICKOS_DRIVES_VALIDATED FASTDATA_DRIVE_VALIDATED
 }
-
 # Function to validate selected drives are not already in use by ZFS
 validate_drives() {
     echo "[$(date)] Validating selected drives are not in use by existing ZFS pools..." >> "$LOGFILE"
-
     # Combine all selected drives for checking
     ALL_SELECTED_DRIVES=("$QUICKOS_DRIVE1" "$QUICKOS_DRIVE2" "$FASTDATA_DRIVE") # Add STORAGE_NFS_DRIVE if used
-
     for drive_path in "${ALL_SELECTED_DRIVES[@]}"; do
         # Check if the drive is part of any ZFS pool
         if zpool status | grep -q "$(basename "$drive_path")"; then
@@ -226,10 +194,8 @@ validate_drives() {
              exit 1
         fi
     done
-
     echo "[$(date)] Drive validation passed." >> "$LOGFILE"
 }
-
 # Function to check if a script has already been completed (based on state file)
 is_script_completed() {
     local script_cmd="$1"
@@ -240,7 +206,6 @@ is_script_completed() {
         return 1  # Script not found (not completed or state file missing)
     fi
 }
-
 # Function to mark a script as completed in the state file
 mark_script_completed() {
     local script_cmd="$1"
@@ -248,7 +213,6 @@ mark_script_completed() {
     echo "$script_cmd" >> "$STATE_FILE"
     echo "[$(date)] Marked script as completed: $script_cmd" >> "$LOGFILE"
 }
-
 # Function to clean up state file
 cleanup_state() {
     if [[ -f "$STATE_FILE" ]]; then
@@ -256,23 +220,18 @@ cleanup_state() {
         echo "[$(date)] Removed state file: $STATE_FILE" >> "$LOGFILE"
     fi
 }
-
 # --- Main Execution ---
-
 # Ensure log file exists and is writable
 touch "$LOGFILE" || { echo "Error: Cannot create log file $LOGFILE"; exit 1; }
 chmod 644 "$LOGFILE"
 echo "[$(date)] Initialized logging for create_phoenix.sh" >> "$LOGFILE"
-
 # Ensure state file exists
 touch "$STATE_FILE" || { echo "Error: Cannot create state file $STATE_FILE" | tee -a "$LOGFILE"; exit 1; }
 chmod 644 "$STATE_FILE"
-
 check_root
 prompt_for_credentials
 prompt_for_drives
 validate_drives # This sets QUICKOS_DRIVES_VALIDATED and FASTDATA_DRIVE_VALIDATED
-
 # List of setup scripts to execute
 # Note: Ensure these scripts exist and are executable
 # Use the validated drive paths and admin credentials
@@ -292,13 +251,11 @@ scripts=(
     "/usr/local/bin/phoenix_setup_samba.sh -p \"$SMB_PASSWORD\""
     # Add more scripts here as needed
 )
-
 # Execute scripts in order, skipping completed ones
 echo "[$(date)] Starting script execution loop..." >> "$LOGFILE"
 # Initialize variables outside the loop to avoid 'local' error
 script_path_to_check=""
 exit_code=0
-
 for script_cmd in "${scripts[@]}"; do
     # - FIX: Avoid 'local' entirely inside the main script loop -
     # Use regular variables instead of 'local' to prevent scope errors
@@ -306,44 +263,62 @@ for script_cmd in "${scripts[@]}"; do
     # Re-initialize for each iteration
     script_path_to_check=""
     exit_code=0
-
     echo "[$(date)] Checking script: $script_cmd" >> "$LOGFILE"
-
     # Check if the script is already completed
     if is_script_completed "$script_cmd"; then
         echo "[$(date)] Skipping completed script: $script_cmd" >> "$LOGFILE"
         continue
     fi
-
     # Check if the script file exists (skip for inline commands like zfsutils-linux check)
     # Extract the script path (first word before any arguments)
     script_path_to_check=$(echo "$script_cmd" | awk '{print $1}')
-
     if [[ -n "$script_path_to_check" ]] && [[ "$script_path_to_check" != "if" ]] && [[ ! -f "$script_path_to_check" ]]; then
         echo "[$(date)] Error: Script file not found: $script_path_to_check" | tee -a "$LOGFILE"
         exit 1
     fi
-
     # Execute the script command
     echo "[$(date)] Executing: $script_cmd" >> "$LOGFILE"
     # Use eval to handle arguments and complex commands correctly
     eval "$script_cmd"
     # Capture the exit code immediately after eval
     exit_code=$?
-
     if [[ $exit_code -ne 0 ]]; then
         echo "[$(date)] Error: Failed to execute $script_cmd (exit code: $exit_code). Exiting." | tee -a "$LOGFILE"
         # Optionally, you could add a retry mechanism or prompt to continue
         exit 1
     fi
-
     # Mark the script as completed
     mark_script_completed "$script_cmd"
 done
-
 echo "[$(date)] All scripts executed successfully." >> "$LOGFILE"
-
 # Cleanup state file upon successful completion
 cleanup_state
-
 echo "Phoenix Proxmox VE setup completed successfully. State file removed for clean manual rerun." | tee -a "$LOGFILE"
+
+# --- NEW: Run Phoenix Animation and Reboot ---
+# Source the animation script to make the function available
+# (Note: phoenix_fly.sh is now a standalone script, not sourced for functions)
+# Ensure the phoenix_fly.sh script is executable
+if [[ ! -x "/usr/local/bin/phoenix_fly.sh" ]]; then
+    echo "[$(date)] Warning: /usr/local/bin/phoenix_fly.sh not found or not executable. Skipping animation." | tee -a "$LOGFILE"
+else
+    echo "[$(date)] Running Phoenix animation..." >> "$LOGFILE"
+    # Run the animation script with the final message as arguments
+    /usr/local/bin/phoenix_fly.sh "Setup complete. Rebooting now. You no longer need root access."
+    # The animation script handles clearing the screen and showing the cursor
+fi
+
+# Log the reboot action
+echo "[$(date)] Initiating system reboot..." >> "$LOGFILE"
+
+# Perform the reboot
+# Using 'nohup' and '&>/dev/null &' detaches the reboot command from the script's execution context,
+# ensuring it runs even if the terminal closes or the script exits.
+# The 'sleep 2' gives a brief moment for the log message to be written.
+nohup bash -c 'sleep 2; reboot' &>/dev/null &
+
+# Exit the script cleanly
+# The reboot command running in the background will take over.
+echo "[$(date)] Reboot command issued. Exiting setup script." >> "$LOGFILE"
+exit 0
+# --- END NEW ---
